@@ -1,13 +1,18 @@
-"""Define lightweight data containers for precisionguide system"""
+"""Define the base data containing classes for precisionguide system
+
+These are designed to be portable across any platform, since they do
+not depend on the specifics of the telescsope control system.  Thus,
+data can be recorded using this code on, e.g., a Windows system and
+uploaded to any other platform for detailed analysis using this same
+code.
+
+"""
 
 import numpy as np
 
-from astropy.io import fits
-
-from astropy.time import Time
-
-from astropy import units as u
 from astropy.nddata import CCDData
+from astropy import units as u
+from astropy.time import Time
 
 class PGCenter():
     """Base class for containing object center and desired center
@@ -78,42 +83,41 @@ class PGCenter():
             self._tmid = np.asarray(value)
 
 
-class PGData():
+class PGData(CCDData):
     """Base class for image data in the `precisionguide` system
 
-    This class contains an individual image data and calculates and/or
-    stores four quantities: :prop:`obj_center`,
-    :prop:`desired_center`, :prop:`quality`, and :prop:`tmid`.  These
-    four quantities are intended to be returned in a :class:`PGCenter`
-    object for subsequent lightweight storage and use in the
-    precisionguide system.  Because precisionguide controls the
-    absolute position of an object (or FOV center) on the CCD,
-    :prop:`desired_center` and :prop:`obj_center` always read in
-    *unbinned* pixel values referenced to the origin of the CCD
-    itself.  Thus, the image input to :class:`PGData` must include
-    both the image FITS header and image array(s)
+    This class stores CCD data using `~astropy.nddata.CCDData` as a
+    superclass and adds properties and methods that calculate/store
+    four quantities: :prop:`obj_center`, :prop:`desired_center`,
+    :prop:`quality`, and :prop:`tmid`.  These four quantities are
+    intended to be returned in a :class:`PGCenter` object for
+    subsequent lightweight storage and use in the precisionguide
+    system.  Because precisionguide controls the absolute position of
+    an object (or FOV center) on the CCD, :prop:`desired_center` and
+    :prop:`obj_center` always read in *unbinned* pixel values
+    referenced to the origin of the CCD itself.  Thus, the image input
+    to :class:`PGData` must include both the image FITS header and
+    image array(s)
 
     Parameters
     ----------
-    input_im : `str`, `~astropy.io.fits.HDUList`, `~astropy.nddata.CCDData`, or `numpy.ndarray`
 
-        Input FITS filename or object
-
-    meta : `~astropy.io.fits.Header`
-        FITS header.  Will replace any header read from file or
-        object
-        Default is ``None``
-"""
+    """
 
     def __init__(self,
-                 data,
-                 meta=None,
+                 *args,
+                 from_read=False,
+                 unit=None,
+                 raw_unit='adu',
                  desired_center=None,
                  date_obs_key='DATE-OBS',
                  exptime_key='EXPTIME',
-                 darktime_key='DARKTIME'):
-        self._data = data
-        self._meta = meta
+                 darktime_key='DARKTIME',
+                 **kwargs):
+        if not from_read:
+            if unit is None:
+                unit = raw_unit
+            super().__init__(*args, unit=unit, **kwargs)
         self._data_unbinned = None
         self._desired_center = None
         self._obj_center = None
@@ -123,51 +127,23 @@ class PGData():
         self.darktime_key = darktime_key
 
     @classmethod
-    def read(cls, filename,
-             meta=None,
+    def read(cls, *args,
+             unit=None,
+             raw_unit='adu',
+             desired_center=None,
+             date_obs_key='DATE-OBS',
+             exptime_key='EXPTIME',
+             darktime_key='DARKTIME',
              **kwargs):
-        with fits.open(filename) as hdul:
-            data = hdul[0].data
-            meta = hdul[0].header
-            return cls(data, meta=meta, **kwargs)
-
-
-
-    #@classmethod
-    #def read(cls, input_im, *args, **kwargs):
-    #    return cls(input_im, *args, **kwargs)
-
-    @property
-    def data(self):
-        return self._data
-        
-    @data.setter
-    def data(self, value):
-        # A little angst about allowing user to reset the data without
-        # checking the center.  Generally, the object should not be
-        # used as a container that gets reused for different images,
-        # but it does seem convenient to be able to overwrite the 
-        if self._data is not None and value.shape != self._data.shape:
-            # Unfortunately, we can't check for subframe origin shift
-            raise ValueError('New data array must be same shape as old array')
-        self._data = value
-        self._data_unbinned = None
-        
-    @property
-    def meta(self):
-        return self._meta
-        
-    @meta.setter
-    def meta(self, value):
-        self._meta = value
-        
-    @property
-    def header(self):
-        return self._meta
-        
-    @header.setter
-    def header(self, value):
-        self.meta = value
+        if unit is None:
+            unit = raw_unit
+        pgd = super(PGData, cls).read(*args, unit=unit, **kwargs)
+        pgd.__init__(from_read=True,
+                     desired_center=desired_center,
+                     date_obs_key=date_obs_key,
+                     exptime_key=exptime_key,
+                     darktime_key=darktime_key)
+        return pgd
 
     @property
     def binning(self):
@@ -265,20 +241,6 @@ class PGData():
         else:
             self._desired_center = np.asarray(value)
 
-    def _card_write(self):
-        # Note pythonic y, x coordinate ordering
-        self.meta['DES_CR0'] = (self._desired_center[1], 'Desired center X')
-        self.meta['DES_CR1'] = (self._desired_center[0], 'Desired center Y')
-        self.meta['OBJ_CR0'] = (self._obj_center[1], 'Object center X')
-        self.meta['OBJ_CR1'] = (self._obj_center[0], 'Object center Y')
-        self.meta['QUALITY'] = (self.quality, 'Quality on 0-10 scale of center determination')
-        self.meta['QUALITY'] = (self.quality, 'Quality on 0-10 scale of center determination')
-
-    def write(self, *args, **kwargs):
-        self._card_write()
-        hdu = fits.PrimaryHDU(self.data, self.meta)
-        hdu.writeto(*args, **kwargs)
-
     @property
     def tmid(self):
         tmid = self.meta.get('tmid')
@@ -299,7 +261,27 @@ class PGData():
 
     @property
     def pgcenter(self):
-        return PGCenter(self.obj_center, self.desired_center, self.quality)
+        return PGCenter(self.obj_center,
+                        self.desired_center,
+                        self.quality,
+                        self.tmid)
+
+    def _card_write(self):
+        # Note pythonic y, x coordinate ordering
+        self.meta['DES_CR0'] = (self.desired_center[1], 'Desired center X')
+        self.meta['DES_CR1'] = (self.desired_center[0], 'Desired center Y')
+        self.meta['OBJ_CR0'] = (self.obj_center[1], 'Object center X')
+        self.meta['OBJ_CR1'] = (self.obj_center[0], 'Object center Y')
+        self.meta['QUALITY'] = (self.quality, 'Quality on 0-10 scale of center determination')
+        self.meta['QUALITY'] = (self.quality, 'Quality on 0-10 scale of center determination')
+        self.meta.insert('DATE-OBS',
+                         ('TMID', self.tmid.value,
+                          'midpoint of exposure, UT'),
+                         after=True)
+
+    def write(self, *args, **kwargs):
+        self._card_write()
+        super().write(*args, **kwargs)
 
 class PGDNoCenter(PGData):
     """Sets :prop:`obj_center` to invalid value"""
@@ -313,17 +295,24 @@ class PGDCentered(PGData):
         self.quality = 10
         return self._obj_center
 
-class PGDOffsetCenter(PGDCentered):
+class PGDOffset(PGData):
     """Offsets :prop:`obj_center` by :prop:`center_offset`"""
 
-    def __init__(self,
-                 *args,
+    def __init__(self, *args,
                  center_offset=None,
                  **kwargs):
-
+        super().__init__(*args, **kwargs)
         self._center_offset = None
         self.center_offset = center_offset
-        super().__init__(*args, **kwargs)        
+
+    @classmethod
+    def read(cls, *args,
+             center_offset=None,
+             **kwargs):
+        pgd = super(PGDOffset, cls).read(*args, **kwargs)
+        pgd.__init__(from_read=True,
+                     center_offset=center_offset)
+        return pgd
 
     @property
     def center_offset(self):
@@ -331,6 +320,7 @@ class PGDOffsetCenter(PGDCentered):
 
     @center_offset.setter
     def center_offset(self, value):
+        print('in center_offset.setter')
         old_center_offset = self.center_offset
         if value is None:
             self.center_offset = (0,0)
@@ -339,6 +329,7 @@ class PGDOffsetCenter(PGDCentered):
         if np.any(self._center_offset != old_center_offset):
             # Prepare to recalculate self._obj_center if we change the offset
             self._obj_center = None
+        print(self.center_offset)
 
     @property
     def obj_center(self):
@@ -366,49 +357,31 @@ class MaxImPGData(PGData):
         subframe_origin *= self.binning
         return subframe_origin
 
-class PGCCDData(PGData, CCDData):
-    """Merges :class:`PGData and :class:`~astropy.nddata.CCDData`"""
-    def __init__(self, *args,
-                 meta=None,
-                 unit=None,
-                 raw_unit='adu',
-                 desired_center=None,
-                 date_obs_key='DATE-OBS',
-                 exptime_key='EXPTIME',
-                 darktime_key='DARKTIME',
-                 **kwargs):
-        if unit is None:
-            unit = raw_unit
-        CCDData.__init__(self, *args, meta=meta, unit=unit, **kwargs)
-        PGData.__init__(self, self.data, meta=self.meta, **kwargs)
-
-    
 #pgc = PGCenter()
 #pgc = PGCenter((1,2), (3,4))
 #pgd = PGData()
 fname = '/data/io/IoIO/raw/2020-07-15/HD87696-0016_Na_off.fit'
-#pgd = PGData(fname)
 
-#ccd = CCDData.read(fname, unit='adu')
+ccd = CCDData.read(fname, unit='adu')
 
 pgd = PGData.read(fname)
-cpgd = PGCCDData.read(fname)
 
 rpgd = PGData(pgd.data, meta=pgd.meta)
 
-rcpgd = PGCCDData(pgd.data, meta=pgd.meta)
-
-#rname = '/data/io/IoIO/reduced/Calibration/2020-05-15_V_flat.fits'
-#pgccd = PGCCDData.read(rname)
-#
-#with fits.open(rname) as hdul:
-#    hdul_pgccd = PGCCDData(hdul)
-#    print(hdul.fileinfo(0))
-#    print(len(hdul))
-
 dspgd = PGData.read(fname, desired_center=(100,100))
-cdspgd = PGCCDData.read(fname, desired_center=(100,100))
+print(dspgd.obj_center, dspgd.desired_center)
 
-#test = MPGCCDData.read(fname)
+dspgd.write('/tmp/test.fits', overwrite=True)
+
+pgdc = PGDCentered.read(fname)
+print(pgdc.obj_center, pgdc.desired_center)
+
+pgdo = PGDOffset(pgd.data, meta=pgd.meta, center_offset=(20,10))
+
+#pgdo = PGDOffset.read(fname)
+#print(pgdo.obj_center, pgdo.desired_center)
+#
+#pgdo = PGDOffset.read(fname, center_offset=(20,10))
+#print(pgdo.obj_center, pgdo.desired_center)
 
 print('done')
