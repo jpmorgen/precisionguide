@@ -1,3 +1,16 @@
+"""Define win32-specific components of the precisionguide system
+
+Currently, MaxIm DL Pro is the only supported camera control system.
+This is accomplished using the MaxImControl object.  The
+PrecisionGuide object is heavily intertwined with MaxImControl,
+calling methods in that object directly.  Thus, for now, both objects
+are defined here.  Ultimately, it would be nice to have an API
+specific to the precisionguide system that enabled complete separation
+between camera control software and the PrecisionGuide object.
+MaxImControl is a start in this direction.
+
+"""
+
 #--> This code was developed using Anaconda3 installed as
 #--> administrator and with PATH option selected during the install so
 #--> that python can be used from a Windows command line.  NOTE: to
