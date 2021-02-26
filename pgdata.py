@@ -7,12 +7,122 @@ uploaded to any other platform for detailed analysis using this same
 code.
 
 """
-
+import inspect 
 import numpy as np
+from scipy.signal import convolve2d
+from scipy.ndimage.measurements import center_of_mass
 
 from astropy.nddata import CCDData
 from astropy import units as u
 from astropy.time import Time
+from astropy.utils import lazyproperty
+
+_NotFound = object()
+
+class pglazyproperty(lazyproperty):
+    """Caching property decorator with auto setting and None reset
+
+    Property in a Python object is usually passive:
+
+    >>> class MyClass
+    >>> self.myprop = 'a'
+    >>> b = myfunct(self.myprop)
+
+    The property decorator enables property to be active, such that a
+    method return value can be considered as property.  The function
+    that implements this is the "getter," with the syntax simplified:
+
+    >>> @property
+    >>> def mycalcprop(self):
+    >>>     a = 1 + 2
+    >>>     return a
+    >>> print(self.mycalcprop)
+    3
+
+    Note that any time ``self.mycalcpropc`` is used, its return value
+    is substituted just as if that was the real property.
+    Importantly, with the configuration above, Python will not let you
+    set the property.  In other words, without another step,
+    self.mycalcprop cannot go on the left side of an ``=``.  The
+    @mycalcproc.setter decorator provides the machinery for that
+    next step.
+
+    >>> @mycalcproc.setter
+    >>> def mycalcproc(self, value):
+    >>>     return value
+    (no par is great if
+    you just want a "one way" property
+
+@property decorator refinement that enables calculations to be done
+    once and stored without a setter (`astropy.utils.pglazyproperty`
+    contribution) and enable the ``@<property>.setter`` to easily
+    modify the user's input value for storage in the caching system
+    (local contribution).  A further local refinement is to allow both
+    initial and subsequent assignment of values to None that leave the
+    system in a state that will run the getter's machinery the next
+    time the property is queried.  If the getter takes a long time to
+    calculate ``None,`` well, there will be no time savings, but at
+    least the system has been arranged so there is no recursion error
+    when ``None`` is the first value.  Example use: enable a setter to be
+    given a ``tuple`` but covert it to a ``numpy.array`` for storage
+    (see also :class:`pglazycoordproperty`).  Use ``del
+    obj.<property>`` or set the property to None to delete the stored
+    value of <property> and redo the calculation.
+
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._none_proxy = 'None proxy'
+    def __get__(self, obj, owner=None):
+        try:
+            obj_dict = obj.__dict__
+            val = obj_dict.get(self._key, _NotFound)
+            if val is self._none_proxy:
+                return None
+            if val is _NotFound or val is None:
+                # I have no idea why self._lock not in the namespace
+                #with self._lock:
+                    # Check if another thread beat us to it.
+                    #val = obj_dict.get(self._key, _NotFound)
+                    #if val is _NotFound or val is None:
+                        val = self.fget(obj)
+                        if val is None:
+                            obj_dict[self._key] = self._none_proxy
+                            return None
+                        obj_dict[self._key] = val                
+            return val
+        
+        except AttributeError:
+            if obj is None:
+                return self
+            raise
+
+    def __set__(self, obj, val):
+        print('setter')
+        obj_dict = obj.__dict__
+        if self.fset:
+            ret = self.fset(obj, val)
+            if ret is not None:
+                obj_dict[self._key] = ret
+                return
+        obj_dict[self._key] = val        
+
+class pglazycoordproperty(pglazyproperty):
+    """Stores property values as np.arrays (e.g., converts tuples)
+    Also enables recalculation when the value is set to None (or
+    value could be deleted as in lazyproperty"""
+
+    def __set__(self, obj, val):
+        obj_dict = obj.__dict__
+        if val is None:
+            if obj_dict.get(self._key) is not None:
+                # Don't delete value in __dict__ unless we have one!
+                del obj_dict[self._key]
+            return
+        val = np.asarray(val)
+        if val.shape != (2,):
+            raise ValueError(f'value "{val}" is not a sensible 2D coordinate')
+        super().__set__(obj, val)
 
 class PGCenter():
     """Base class for containing object center and desired center
@@ -20,7 +130,22 @@ class PGCenter():
 
     Parameters
     ----------
-    obj_center : 
+    obj_center : tuple or array
+        Center of object, (y, x) in *unbinned* coordinates referenced to the
+        *origin* of the CCD.  Note Python C array indexing into 2D array
+
+    desired_center : tuple-like
+        Desired center of object, (y, x) in *unbinned* coordinates
+        referenced to the *origin* of the CCD.  Note Python C array
+        indexing into 2D array
+
+    quality : int
+        0 -- 10 ranking of quality of quality of ``obj_center``
+        determination, with 0 = very bad, 10 = very good
+
+    tmid : `~astropy.time.Time`
+        Time at midpoint of observation
+
     """
     def __init__(self,
                  obj_center=None,
@@ -32,55 +157,32 @@ class PGCenter():
         self.quality = quality
         self.tmid = tmid
 
-    @property
+    # Our decorator does everything we need :-)
+    @pglazycoordproperty
     def obj_center(self):
-        return self._obj_center
+        pass
         
-    @obj_center.setter
-    def obj_center(self, value):
-        if value is None:
-            self._obj_center = None
-        else:
-            self._obj_center = np.asarray(value)
-
-    @property
+    @pglazycoordproperty
     def desired_center(self):
-        if self._desired_center is not None:
-            return self._desired_center
-    
-    @desired_center.setter
-    def desired_center(self, value):
-        if value is None:
-            self._desired_center = None
-        else:
-            self._desired_center = np.asarray(value)
+        pass
 
-    @property
+    @pglazyproperty
     def quality(self):
-        if self._quality is not None:
-            return self._quality
+        pass
         
     @quality.setter
     def quality(self, value):
+        """Unset quality translates to 0 quality"""
         if value is None:
-            self._quality = None
-            return self._quality
+            value = 0
         if not isinstance(value, int) or value < 0 or value > 10:
             raise ValueError('quality must be an integer value from 0 to 10')
         else:
-            self._quality = value
+            return value
         
-    @property
+    @pglazycoordproperty
     def tmid(self):
-        if self._tmid is not None:
-            return self._tmid
-        
-    @tmid.setter
-    def tmid(self, value):
-        if value is None:
-            self._tmid = None
-        else:
-            self._tmid = np.asarray(value)
+        pass
 
 
 class PGData(CCDData):
@@ -109,41 +211,116 @@ class PGData(CCDData):
                  from_read=False,
                  unit=None,
                  raw_unit='adu',
+                 obj_center=None,
                  desired_center=None,
+                 quality=0,
                  date_obs_key='DATE-OBS',
                  exptime_key='EXPTIME',
                  darktime_key='DARKTIME',
                  **kwargs):
-        if not from_read:
-            if unit is None:
-                unit = raw_unit
+        # Order is important!  Handle superclass first then subclass
+        # for the reasons detailed below.
+        #
+        # Structure __init__ so that both standard instantiation and
+        # .read classmethod can use the same code.  This enables us to
+        # have one place where we separate out our subclass keywords
+        # from the superclass keywords (**kwargs)
+
+        # Handle super first to ensure image and meta property are
+        # installed into the object before we invoke any code later in
+        # the __init__ that might assume its presence
+        if unit is None:
+            unit = raw_unit
+        if from_read:
+            # Instantiate a new object with the super().read
+            # classmethod and copy its property into our current
+            # object.  Copying property over rather than just
+            # reassigning "self" is necessary because when an object
+            # is instantiated, an object reference is created that is
+            # permanently associated with the object.  Simple
+            # reassignment of self (e.g. self = ccd) does not have the
+            # expected effect -- it just changes the place self points
+            # to in the routine the assignment was made (e.g.,
+            # __init__ in this case) and then when the routine exits,
+            # the original "self" is used.  Note also that when we
+            # call our super().read method and the object is
+            # instantiated, this __init__ is read all over again,
+            # since a new object is being created.  Since we don't
+            # pass any parameters relevant to the subclass when we do
+            # our super().read, all subclass property remains set to
+            # the defaults.  When we __dict__.update our local
+            # property, we copy over this freshly initialized property
+            # to our current property.  Below, we re-initialize the
+            # property with the actual keywords we provided to the
+            # original .read call
+            ccd = super().read(*args, unit=unit, **kwargs)
+            self.__dict__.update(ccd.__dict__)
+        else:
             super().__init__(*args, unit=unit, **kwargs)
-        self._data_unbinned = None
-        self._desired_center = None
-        self._obj_center = None
+        ## Generally the object will calculate these
+        #if obj_center is not None:
+        #    self.obj_center = obj_center
+        #if desired_center is not None:
+        #    self.desired_center = desired_center
+        #if quality is not None:
+        #    self.quality = quality
+        # Generally the object will calculate these
+        self.obj_center = obj_center
         self.desired_center = desired_center
+        self.quality = quality
         self.date_obs_key = date_obs_key
         self.exptime_key = exptime_key
         self.darktime_key = darktime_key
 
     @classmethod
-    def read(cls, *args,
-             unit=None,
-             raw_unit='adu',
-             desired_center=None,
-             date_obs_key='DATE-OBS',
-             exptime_key='EXPTIME',
-             darktime_key='DARKTIME',
-             **kwargs):
-        if unit is None:
-            unit = raw_unit
-        pgd = super(PGData, cls).read(*args, unit=unit, **kwargs)
-        pgd.__init__(from_read=True,
-                     desired_center=desired_center,
-                     date_obs_key=date_obs_key,
-                     exptime_key=exptime_key,
-                     darktime_key=darktime_key)
-        return pgd
+    def read(cls, *args, **kwargs):
+        return cls(*args, from_read=True, **kwargs)
+
+    @pglazycoordproperty
+    def obj_center(self):
+        # Here is our fancy calculation that takes a long time.
+        # DESIGN NOTE: obj_center and desired_center use 
+        # the pglazyproperty system so that they can be set to an
+        # arbitrary value at any time.  Recalculation is triggered by 
+        # and stored as an np.array without recalculation.  In
+        # other words, we calculate just once but we enable 
+        obj_center = np.asarray((-99, -99))
+        self.quality = 0
+        return obj_center
+
+    @pglazycoordproperty
+    def desired_center(self):
+        # Here is where the complicated desired_center calculation is
+        # done:
+        return np.asarray(self.data.shape)/2
+
+    @pglazyproperty
+    def quality(self):
+        self.obj_center
+
+    @pglazyproperty
+    def tmid(self):
+        tmid_str = self.meta.get('tmid')
+        if tmid_str is not None:
+            return Time(tmid_str, format='fits')
+        try:
+            exptime = self.meta.get(self.darktime_key.lower()) 
+            if exptime is None:
+                exptime = self.meta[self.exptime_key.lower()]
+            exptime *= u.s
+            dateobs_str = self.meta[self.date_obs_key.lower()] 
+            return Time(dateobs_str, format='fits') + exptime/2
+        except:
+            log.error(f'Cannot read sufficient combination of '
+                      '{self.date_obs_key}, {self.darktime_key} '
+                      'and/or {self.exptime_key} keywords from FITS '
+                      'header to establish tmid')
+            return None
+
+    @tmid.setter
+    def tmid(self, val):
+        if not isinstance(val, Time):
+            raise ValueError('tmid must be of type `~astropy.time.Time`')
 
     @property
     def binning(self):
@@ -201,63 +378,11 @@ class PGData(CCDData):
             unbinned = full_unbinned
         return unbinned
 
-    @property
+    @pglazyproperty
     def data_unbinned(self):
         """Returns an unbinned version of data
         """
-        if self._data_unbinned is not None:
-            return self._data_unbinned
-        self._data_unbinned = self.im_unbinned(self.data)
-        return self._data_unbinned
-
-    @property
-    def obj_center(self):
-        if self._obj_center is not None:
-            return self._obj_center
-        self._obj_center = (-99, -99)
-        self.quality = 0
-        return self._obj_center
-
-    @obj_center.setter
-    def obj_center(self, value):
-        if value is None:
-            self._obj_center = None
-        else:
-            self._obj_center = np.asarray(value)
-
-    @property
-    def desired_center(self):
-        if self._desired_center is not None:
-            return self._desired_center
-        # Here is where the complicated desired_center calculation is
-        # done:
-        self._desired_center = np.asarray(self.data.shape)/2
-        return self._desired_center
-
-    @desired_center.setter
-    def desired_center(self, value=None):
-        if value is None:
-            self._desired_center = None
-        else:
-            self._desired_center = np.asarray(value)
-
-    @property
-    def tmid(self):
-        tmid = self.meta.get('tmid')
-        if self.meta.get('tmid') is not None:
-            return tmid
-        try:
-            exptime = self.meta.get(self.darktime_key.lower()) 
-            if exptime is None:
-                exptime = self.meta[self.exptime_key.lower()]
-            exptime *= u.s
-            tmid = (Time(self.meta[self.date_obs_key.lower()],
-                         format='fits')
-                    + exptime/2)
-        except:
-            log.warning(f'Cannot read {self.darktime_key} and/or {self.exptime_key} keywords from FITS header')
-            tmid = None
-        return tmid
+        return self.im_unbinned(self.data)
 
     @property
     def pgcenter(self):
@@ -283,73 +408,141 @@ class PGData(CCDData):
         self._card_write()
         super().write(*args, **kwargs)
 
-class PGDNoCenter(PGData):
-    """Sets :prop:`obj_center` to invalid value"""
+class NoCenterPGD(PGData):
+    """Sets :prop:`obj_center` to invalid value and :prop:`quality` to 0`"""
     pass
 
-class PGDCentered(PGData):
+class CenteredPGD(PGData):
     """Sets :prop:`obj_center` to :prop:`desired_center`"""
-    @property
-    def obj_center(self):
-        self._obj_center = self.desired_center
-        self.quality = 10
-        return self._obj_center
 
-class PGDOffset(PGData):
-    """Offsets :prop:`obj_center` by :prop:`center_offset`"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._old_desired_center = None
+    
+
+    @pglazycoordproperty
+    def obj_center(self):
+        self.quality = 10
+        return self.desired_center
+
+    @pglazycoordproperty
+    def desired_center(self):
+        return super().desired_center
+
+    @desired_center.setter
+    def desired_center(self, value):
+        # Reset obj_center for proper recalculation
+        self.obj_center = None
+        return value
+
+class OffsetPGD(PGData):
+    """Offsets :prop:`obj_center` by :prop:`center_offset`  Note:
+    proper object that determins center needs to be inherited before
+    this for sensible center: e.g.: 
+    class MyPGD(PGDOffset, PGDCentered): pass"""
 
     def __init__(self, *args,
                  center_offset=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
-        self._center_offset = None
+        # Center offset is used in the calculation of a
+        # pglazycoordproperty such that we want to delete that
+        # property for recalculation in the event center_offset
+        # changes.  Particularly considering we end up in np.arrays
+        # and the += operator increments the object numpy object
+        # itself (e.g. pgd.center_offset += (10,10)), this is just a
+        # little too complex for the pglazycoordproperty system to
+        # handle, so do it the olde fashionede waye
+
+        # This copy is key for avoiding subtle assign by reference bugs
+        if center_offset is None:
+            center_offset = (0,0)
+        self._old_center_offset = center_offset
         self.center_offset = center_offset
+        #self._center_offset = np.asarray(center_offset)
 
-    @classmethod
-    def read(cls, *args,
-             center_offset=None,
-             **kwargs):
-        pgd = super(PGDOffset, cls).read(*args, **kwargs)
-        pgd.__init__(from_read=True,
-                     center_offset=center_offset)
-        return pgd
+    @pglazycoordproperty
+    def calculated_center(self):
+        # It is important this be its own name, since the lazyproperty
+        # system works on the __dict__ key in the current object.  So
+        # it doesn't "stick" from the super, but it does here under a
+        # new name
+        return super().obj_center
 
-    @property
+    #@property
+    #def center_offset(self):
+    #    return self._center_offset
+
+    @pglazycoordproperty
+    def _old_center_offset(self):
+        return np.asarray((0,0))
+
+    @pglazycoordproperty
     def center_offset(self):
-        return self._center_offset
+        return np.asarray((0,0))
 
     @center_offset.setter
     def center_offset(self, value):
-        print('in center_offset.setter')
-        old_center_offset = self.center_offset
+        print(value)
         if value is None:
-            self.center_offset = (0,0)
-        else:
-            self._center_offset = np.asarray(value)
-        if np.any(self._center_offset != old_center_offset):
-            # Prepare to recalculate self._obj_center if we change the offset
-            self._obj_center = None
-        print(self.center_offset)
+            value = (0,0)
+        value = np.asarray(value)
+        print(value)
+        if not np.all(self._old_center_offset == value):
+            self._old_center_offset = value.copy()
+            self.obj_center = None
+        return value
 
-    @property
+    @pglazycoordproperty
     def obj_center(self):
-        if self._obj_center is not None:
-            return self._obj_center
-        self._obj_center = super().obj_center + self.center_offset
-        return self._obj_center
+        return self.calculated_center + self.center_offset
 
+class MaxPGD(PGData):
+    @pglazyproperty
+    def obj_center(self):
+        self.quality = 6
+        obj_center = np.unravel_index(np.argmax(self), self.shape)
+        return np.asarray(obj_center)
+    
+class BrightestPGD(PGData):
+    def __init__(self, *args,
+                 seeing=2,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.seeing = seeing
 
-class MaxImPGData(PGData):
-    """MaxIM DL adjustments to the PGData class"""
+    @pglazyproperty
+    def obj_center(self):
+        # Still working on this
+        return super().obj_center + self.center_offset
+    
+class CenterOfMassPGD(PGData):
+    """Use simple center-of-mass calculation to find center of
+    brightest object.  Works best if pixels not likely to be part of
+    the source are set to zero."""
 
-    @property
+    @pglazyproperty
+    def obj_center(self):
+        # Still working on this
+        return super().obj_center + self.center_offset
+
+class MaxImPGD(PGData):
+    """Handles MaxIM DL :prop:`binning` and :prop:`subframe_origin`"""
+
+    # It is important to just read these once, since we may modify
+    # them in the object before write
+    @pglazyproperty
     def binning(self):
         """Image binning in Y,X order"""
         binning = np.asarray((self.meta['YBINNING'],
                               self.meta['XBINNING']))
         return np.asarray(binning)
         
-    @property
+    @binning.setter
+    def binning(self, value=None):
+        return np.asarray(value)
+
+    @pglazyproperty
     def subframe_origin(self):
         """Subframe origin in *unbinned* pixels with full CCD origin = (0,0).  Y,X order"""
         subframe_origin = np.asarray((self.meta['YORGSUBF'],
@@ -357,31 +550,115 @@ class MaxImPGData(PGData):
         subframe_origin *= self.binning
         return subframe_origin
 
+    @subframe_origin.setter
+    def subframe_origin(self, value=None):
+        return np.asarray(value)
+
+    def _card_write(self):
+        # Note pythonic y, x coordinate ordering
+        self.meta['XBINNING'] = self.binning[1]
+        self.meta['YBINNING'] = self.binning[0]
+        self.meta['XORGSUBF'] = self.subframe_origin[1]
+        self.meta['YORGSUBF'] = self.subframe_origin[0]
+        super()._card_write()
+
+    def write(self, *args, **kwargs):
+        self._card_write()
+        super().write(*args, **kwargs)
+
 #pgc = PGCenter()
+#print(pgc.obj_center)
+#pgc.obj_center = (1,1)
+#pgc.obj_center = 1
+#print(pgc.obj_center)
 #pgc = PGCenter((1,2), (3,4))
 #pgd = PGData()
 fname = '/data/io/IoIO/raw/2020-07-15/HD87696-0016_Na_off.fit'
+#
+class MyPGD(OffsetPGD, CenteredPGD, PGData):
+    pass
 
-ccd = CCDData.read(fname, unit='adu')
+#pgd = PGData.read(fname)
+#print(pgd.obj_center, pgd.desired_center)
+#pgd.obj_center = (1,1)
+#print(pgd.obj_center, pgd.desired_center)
+#pgd = PGData.read(fname, obj_center=(2,2))
+#print(pgd.obj_center, pgd.desired_center)
+#pgd.desired_center = (1,1)
+#del pgd.desired_center
+#pgd.obj_center = None
+#print(pgd.obj_center, pgd.desired_center)
+pgd = MyPGD.read(fname)
+print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+pgd.center_offset += np.asarray((10, -10))
+pgd.center_offset += (10, -10)
+print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+pgd.center_offset = None
+pgd.desired_center = (3,3)
+#pgd.center_offset += (10, -30)
+#pgd.center_offset = (10, -10)
+print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+#pgd.obj_center = (0,0)
+#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+#pgd.obj_center = None
+#del pgd.obj_center
+#pgd.calculated_center = (0,0)
+#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+#pgd.center_offset = pgd.center_offset + (10, -10)
+#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+#pgd.center_offset += (10, -30)
+#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
 
-pgd = PGData.read(fname)
+#pgd.obj_center = (1,1)
+#pgd.desired_center = (1,1)
+#print(pgd.obj_center, pgd.desired_center)
+#del pgd.desired_center
+#print(pgd.obj_center, pgd.desired_center)
+#pgd.center_offset = (20. -10)
+#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
 
-rpgd = PGData(pgd.data, meta=pgd.meta)
+#pgd = MaxPGD.read(fname)
+#print(pgd.obj_center)
+#class MyPGD(OffsetPGD, MaxPGD):
+#    pass
+#pgd = MyPGD.read(fname, center_offset=(-10,20))
+#print(pgd.obj_center)
+#print(pgd.desired_center)
 
-dspgd = PGData.read(fname, desired_center=(100,100))
-print(dspgd.obj_center, dspgd.desired_center)
-
-dspgd.write('/tmp/test.fits', overwrite=True)
-
-pgdc = PGDCentered.read(fname)
-print(pgdc.obj_center, pgdc.desired_center)
-
-pgdo = PGDOffset(pgd.data, meta=pgd.meta, center_offset=(20,10))
-
+#
+#ccd = CCDData.read(fname, unit='adu')
+#
+#rpgd = PGData(ccd.data, meta=ccd.meta)
+#print(pgd.desired_center)
+#
+#pgd = PGData.read(fname)
+#print(pgd.desired_center)
+#
+#pgd = PGData.read(fname, desired_center=(2,2))
+#print(pgd.desired_center)
+#
+#dspgd = PGData.read(fname, desired_center=(100,100))
+#print(dspgd.obj_center, dspgd.desired_center)
+#
+#dspgd.write('/tmp/test.fits', overwrite=True)
+#
+#pgdc = PGDCentered.read(fname)
+#print(pgdc.obj_center, pgdc.desired_center)
+#
 #pgdo = PGDOffset.read(fname)
+#print(pgdo.obj_center, pgdo.desired_center)
+#
+#pgdo = PGDOffset(pgd.data, meta=pgd.meta, center_offset=(20,10))
 #print(pgdo.obj_center, pgdo.desired_center)
 #
 #pgdo = PGDOffset.read(fname, center_offset=(20,10))
 #print(pgdo.obj_center, pgdo.desired_center)
+#
+#class MyPGD(PGDOffset, PGDCentered):
+#    pass
+#
+#mpgd = MyPGD.read(fname, center_offset=(20,10))
+#print(mpgd.obj_center, mpgd.desired_center)
+#
+#print('done')
 
-print('done')
