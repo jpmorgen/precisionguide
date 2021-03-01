@@ -7,7 +7,6 @@ uploaded to any other platform for detailed analysis using this same
 code.
 
 """
-import inspect 
 import numpy as np
 from scipy.signal import convolve2d
 from scipy.ndimage.measurements import center_of_mass
@@ -18,6 +17,125 @@ from astropy.time import Time
 from astropy.utils import lazyproperty
 
 _NotFound = object()
+
+class pgproperty(property):
+    """Caching property decorator with auto setting and None reset
+
+    . myprop = None resets system and forces the getter to run
+
+    . when getter runs and returns a non-None value, that value is
+    cached and returned instead of running the getter
+
+    . myprop = 'some_value' overrides the getter -- 'some_value' is
+    cached and returned on subsequent queries of myprop
+
+    . No setter is required to set the property, but if one is
+    provided, its return value is used as the cached value that
+    overrides the getter (i.e., not knowledge of the internal workings
+    of the system is requried to make it work)
+
+    . Deleters can be specified to do something before the cache
+    reference is deleted.  Deletion is not permanent -- the next time
+    myprop is queried, the getter is run
+
+    Parameters
+    ----------
+    ndimensions : int or None
+        If not `None`, value returned by setter or if no setter is
+        present, value provided by user, is converted into an np.array
+        and checking is done that it is ndimensions (e.g., 2).  Use
+        ndimensions = 0 to make the conversion to np.array but avoid
+        the check
+
+    Inspired by `astropy.utils.lazyproperty` and `property_manager
+    <https://github.com/xolox/python-property-manager>`
+
+    .NOTE: This cache operates on the top-level property.  In a
+    complicated multi-inheritance system with inter-connected property
+    like `pgdata`, some time savings in calculation of quantities
+    could be achieved by caching property at each inheritance level
+    individually, say by making the `key` a string that includes the
+    property name, `self.__class__.__name__` and also the module name
+    just to make sure it is unique.  Then a None reset would only
+    reset the levels from the top down to the MRO at which the
+    property was set to None.  This guarantees the children get a
+    freshly calculated value of the affected properties and
+    acknowledges that the parents don't care that the change was made,
+    since they never depended on the relationship between the property
+    in the first place.  Or if they did, they should be super()ed into
+    the calculation and the most senior setter concerned about the
+    interrelationship would also be calling for the reset of the
+    affected other property.  The side-affect of caching all of the
+    intermediate results would be more memory use, since all of the
+    intermediate property would have long-lived references.  For the
+    pgdata coordiate-oriented stuff, this is not a big deal, but it is
+    not generally appropriate
+
+    """
+    
+    ndimensions=None
+    def __init__(self, fget,
+                 fset=None,
+                 fdel=None,
+                 doc=None):
+        super().__init__(fget, fset, fdel, doc)
+        self._key = self.fget.__name__
+        self._none_proxy = 'None proxy'
+
+    def __get__(self, obj, owner=None):
+        try:
+            obj_dict = obj.__dict__
+            val = obj_dict.get(self._key, _NotFound)
+            if val is self._none_proxy:
+                return None
+            if val is _NotFound or val is None:
+                val = self.fget(obj)
+                if val is None:
+                    obj_dict[self._key] = self._none_proxy
+                    return None
+                obj_dict[self._key] = val                
+            return val
+        except AttributeError:
+            if obj is None:
+                return self
+            raise
+
+    def __set__(self, obj, val):
+        obj_dict = obj.__dict__
+        if self.fset:
+            val = self.fset(obj, val)
+        if val is not None and ndimensions is not None:
+            val = np.asarray(val)
+            if (ndimensions > 0
+                and val.shape != (ndimensions,)):
+                raise ValueError(f'value "{val}" is not a sensible {self._ndimensions}-dimension coordinate')
+        obj_dict[self._key] = val
+
+    def __delete__(self, obj):
+        if self.fdel:
+            self.fdel(obj)
+        obj.__dict__.pop(self._key, None)    # Delete if present
+
+
+class pgcoordproperty(pgproperty):
+    ndimensions=2
+
+#class pgcoordproperty(pgproperty):
+#    """Stores property values as np.arrays (e.g., converts tuples)
+#    Also enables recalculation when the value is set to None (or
+#    value could be deleted as in lazyproperty"""
+#
+#    def __set__(self, obj, val):
+#        obj_dict = obj.__dict__
+#        if val is None:
+#            if obj_dict.get(self._key) is not None:
+#                # Don't delete value in __dict__ unless we have one!
+#                del obj_dict[self._key]
+#            return
+#        val = np.asarray(val)
+#        if val.shape != (2,):
+#            raise ValueError(f'value "{val}" is not a sensible 2D coordinate')
+#        super().__set__(obj, val)
 
 class pglazyproperty(lazyproperty):
     """Caching property decorator with auto setting and None reset
@@ -432,7 +550,8 @@ class CenteredPGD(PGData):
     @desired_center.setter
     def desired_center(self, value):
         # Reset obj_center for proper recalculation
-        self.obj_center = None
+        #self.obj_center = None
+        del self.obj_center
         return value
 
 class OffsetPGD(PGData):
@@ -462,18 +581,6 @@ class OffsetPGD(PGData):
         #self._center_offset = np.asarray(center_offset)
 
     @pglazycoordproperty
-    def calculated_center(self):
-        # It is important this be its own name, since the lazyproperty
-        # system works on the __dict__ key in the current object.  So
-        # it doesn't "stick" from the super, but it does here under a
-        # new name
-        return super().obj_center
-
-    #@property
-    #def center_offset(self):
-    #    return self._center_offset
-
-    @pglazycoordproperty
     def _old_center_offset(self):
         return np.asarray((0,0))
 
@@ -489,13 +596,14 @@ class OffsetPGD(PGData):
         value = np.asarray(value)
         print(value)
         if not np.all(self._old_center_offset == value):
+            del self.obj_center
             self._old_center_offset = value.copy()
             self.obj_center = None
         return value
 
     @pglazycoordproperty
     def obj_center(self):
-        return self.calculated_center + self.center_offset
+        return super().obj_center + self.center_offset
 
 class MaxPGD(PGData):
     @pglazyproperty
@@ -598,12 +706,12 @@ pgd.desired_center = (3,3)
 #pgd.center_offset += (10, -30)
 #pgd.center_offset = (10, -10)
 print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
-#pgd.obj_center = (0,0)
-#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
-#pgd.obj_center = None
+pgd.obj_center = (0,0)
+print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+pgd.obj_center = None
 #del pgd.obj_center
 #pgd.calculated_center = (0,0)
-#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
 #pgd.center_offset = pgd.center_offset + (10, -10)
 #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
 #pgd.center_offset += (10, -30)
