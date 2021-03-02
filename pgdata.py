@@ -17,7 +17,7 @@ from astropy import units as u
 from astropy.time import Time
 from astropy.convolution import Gaussian2DKernel
 
-from IoIO.ccdmultipipe import FBUCCDData
+from IoIO.ccdmultipipe import fallback_unit_ccddata_reader
 
 _NotFound = object()
 
@@ -193,6 +193,55 @@ class PGCenter():
     def tmid(self):
         pass
 
+class FBUCCDData(CCDData):
+    """
+    Add ``fallback_unit`` capability to :meth:`CCDData.read() <~astropy.nddata.CCDData.read>`
+
+    Paramters
+    ---------
+    filename : str
+        Name of FITS file
+
+    unit : `~astropy.units.Unit`, optional
+        Units of the image data.   If ``None,`` the FITS header
+        ``BUNIT`` keyword will be queried to set the unit.  If that
+        is not found or an error is raised, `fallback_unit` will be
+        used.
+        Default is ``None``.
+
+    fallback_unit : `~astropy.units.Unit`, optional
+        Units to be used for the image data if `unit` is not provided
+        and no valid ``BUNIT`` value is found in the FITS header.
+        Default is ``None``.
+
+    kwargs :
+        Keywords to pass to :meth:`CCDData.read() <~astropy.nddata.CCDData.read>`
+
+    """
+    def __init__(self, *args,
+                 filename=None,
+                 fallback_unit=None,
+                 **kwargs):
+        if filename is not None:
+            ccd = fallback_unit_ccddata_reader(filename, *args, 
+                                               fallback_unit=fallback_unit,
+                                               **kwargs)
+            self.__dict__.update(ccd.__dict__)
+        else:
+            super().__init__(*args, **kwargs)
+
+    @classmethod
+    def read(cls, filename, *args,
+             fallback_unit=None,
+             **kwargs):
+        return cls(*args,
+                   filename=filename, 
+                   fallback_unit=fallback_unit,
+                   **kwargs)
+        #ccd = fallback_unit_ccddata_reader(filename, *args, 
+        #                                   fallback_unit=fallback_unit,
+        #                                   **kwargs)
+        #return ccd
 
 class PGData(CCDData):
     """Base class for image data in the `precisionguide` system
@@ -226,7 +275,6 @@ class PGData(CCDData):
                  exptime_key='EXPTIME',
                  darktime_key='DARKTIME',
                  **kwargs):
-        # This if is causing problems
         if unit is None:
             unit = raw_unit
         super().__init__(*args, unit=unit, **kwargs)
@@ -239,7 +287,6 @@ class PGData(CCDData):
 
     @classmethod
     def read(cls, filename, *args, 
-             unit=None,
              raw_unit='adu',
              obj_center=None,
              desired_center=None,
@@ -248,60 +295,22 @@ class PGData(CCDData):
              exptime_key='EXPTIME',
              darktime_key='DARKTIME',
              **kwargs):
-        if unit is not None:
-            return \
-                super(PGData, cls).read(filename, *args,
-                                        unit=unit,
-                                        obj_center=obj_center,
-                                        desired_center=desired_center,
-                                        quality=quality,
-                                        date_obs_key=date_obs_key,
-                                        exptime_key=exptime_key,
-                                        darktime_key=darktime_key,
-                                        **kwargs)
-        # Open the file and read the primary hdr to see if there is a
-        # BUNIT there.  Do the open as a memmap to minimize overhead
-        # on the second file read in CCDData
-        with fits.open(filename, memmap=True) as hdul:
-            hdr = hdul[0].header
-            bunit = hdr.get('BUNIT')
-            if bunit is not None:
-                try:
-                    # CCDData will find BUNIT again
-                    print('here')
-                    return \
-                        super(PGData,
-                              cls).read(filename, *args,
-                                        from_read=True,
-                                        obj_center=obj_center,
-                                        desired_center=desired_center,
-                                        quality=quality,
-                                        date_obs_key=date_obs_key,
-                                        exptime_key=exptime_key,
-                                        darktime_key=darktime_key,
-                                        **kwargs)
-                except ValueError:
-                    # BUNIT may not be valid
-                    log.warning(f'Potentially invalid BUNIT value {bunit}  '
-                                'detected in FITS header')
-                    pass
-            # BUNIT missing or unusable or possiby another error
-            return \
-                super(PGData, cls).read(filename, *args,
-                                           unit=raw_unit,
-                                           obj_center=obj_center,
-                                           desired_center=desired_center,
-                                           quality=quality,
-                                           date_obs_key=date_obs_key,
-                                           exptime_key=exptime_key,
-                                           darktime_key=darktime_key,
-                                           **kwargs)
-
-    #def read(cls, filename, *args, **kwargs):
-    #    # Collect our *arg and **kwarg processing in all cases in
-    #    # __init__.  To do this, we need to encode the filename
-    #    # somehow.
-    #    return cls(*args, from_read=filename, **kwargs)
+        #ccd = fallback_unit_ccddata_reader(filename, *args,
+        ccd = FBUCCDData.read(filename, *args, 
+                              fallback_unit=raw_unit,
+                              **kwargs)
+        # Make a vestigial pgd
+        pgd = cls(ccd.data,
+                  unit=ccd.unit,
+                  obj_center=obj_center,
+                  desired_center=desired_center,
+                  quality=quality,
+                  date_obs_key=date_obs_key,
+                  exptime_key=exptime_key,
+                  darktime_key=darktime_key)
+        # Merge in ccd property
+        pgd.__dict__.update(ccd.__dict__)
+        return pgd
 
     @pgcoordproperty
     def obj_center(self):
@@ -638,9 +647,12 @@ class MyPGD(OffsetPGD, MaxPGD):
 #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
 
 bname = '/data/io/IoIO/reduced/Calibration/2020-07-07_ccdT_-10.3_bias_combined.fits'
-pgd = MaxPGD.read(bname)
+bpgd = MyPGD.read(bname)
+epgd = MyPGD.read(bname, unit='adu')
+#ccd = FBUCCDData.read(bname)
 
-ccd = FBUCCDData.read(bname)
+pgd = MyPGD.read(fname)
+
 
 #print(pgd.desired_center)
 
@@ -681,3 +693,12 @@ ccd = FBUCCDData.read(bname)
 #
 #print('done')
 
+bname = '/data/io/IoIO/reduced/Calibration/2020-07-07_ccdT_-10.3_bias_combined.fits'
+#ccd = CCDData.read(bname)
+
+fname1 = '/data/Mercury/raw/2020-05-27/Mercury-0005_Na-on.fit'
+#ccd = CCDData.read(fname1)
+ccd = FBUCCDData.read(fname1, fallback_unit='adu')
+#ccd = FBUCCDData.read(fname1, fallback_unit='aduu')
+
+ccd = FBUCCDData.read(fname1, unit='electron')
