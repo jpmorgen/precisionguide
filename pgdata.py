@@ -11,6 +11,7 @@ import numpy as np
 from scipy.signal import convolve2d
 from scipy.ndimage.measurements import center_of_mass
 
+from astropy.io import fits
 from astropy.nddata import CCDData
 from astropy import units as u
 from astropy.time import Time
@@ -225,45 +226,105 @@ class PGData(CCDData):
                  exptime_key='EXPTIME',
                  darktime_key='DARKTIME',
                  **kwargs):
+        
+
+
         # Order is important!  Handle superclass first then subclass
         # for the reasons detailed below.
         #
         # Structure __init__ so that both standard instantiation and
         # .read classmethod can use the same code.  This enables us to
         # have one place where we separate out our subclass keywords
-        # from the superclass keywords (**kwargs)
+        # from the superclass keywords (**kwargs).  Potentially
+        # undesirable side affect in the classmethod case: we run our
+        # __init__ twice.  Once with from_read not set because Python
+        # is simply creating the empty object and once for real when
+        # we actually instantiate the cls
 
-        # Handle super first to ensure image and meta property are
-        # installed into the object before we invoke any code later in
-        # the __init__ that might assume its presence
-        if unit is None:
-            unit = raw_unit
-        if from_read:
-            # Instantiate a new object with the super().read
-            # classmethod and copy its property into our current
-            # object.  Copying property over rather than just
-            # reassigning "self" is necessary because when an object
-            # is instantiated, an object reference is created that is
-            # permanently associated with the object.  Simple
-            # reassignment of self (e.g. self = ccd) does not have the
-            # expected effect -- it just changes the place self points
-            # to in the routine the assignment was made (e.g.,
-            # __init__ in this case) and then when the routine exits,
-            # the original "self" is used.  Note also that when we
-            # call our super().read method and the object is
-            # instantiated, this __init__ is read all over again,
-            # since a new object is being created.  Since we don't
-            # pass any parameters relevant to the subclass when we do
-            # our super().read, all subclass property remains set to
-            # the defaults.  When we __dict__.update our local
-            # property, we copy over this freshly initialized property
-            # to our current property.  Below, we re-initialize the
-            # property with the actual keywords we provided to the
-            # original .read call
-            ccd = super().read(*args, unit=unit, **kwargs)
-            self.__dict__.update(ccd.__dict__)
-        else:
+        if not from_read:
+            # Simple case of ingredients specified on instantiation.
+            # unit must be specified.  We have a pre-defined fallback
+            if unit is None:
+                unit = raw_unit
+            # Build up our super() property first and add our local
+            # property later
             super().__init__(*args, unit=unit, **kwargs)
+        else:
+            # We have been called from the read classmethod.  In this
+            # case, create a ccd with super().read and merge it into
+            # the currently instantiated self.  The merge is necessary
+            # because the originally instantiated object reference is
+            # what is associated with the object.  It cannot be
+            # reassigned.
+            filename = from_read
+            if unit is not None:
+                # simple case -- we know our unit
+                ccd = super().read(filename, *args, unit=unit, **kwargs)
+            else:
+                # Open the file and read the primary hdr to see if
+                # there is a BUNIT there.  Do the open as a memmap to
+                # minimize overhead on the second file read in CCDData
+                with fits.open(filename, memmap=True) as hdul:
+                    hdr = hdul[0].header
+                    bunit = hdr.get('BUNIT')
+                    print(f'BUNIT = {bunit}')
+                    if bunit is None:
+                        # BUNIT missing or unusable or possiby another error
+                        ccd = \
+                            super().read(filename, *args,
+                                         unit=raw_unit,
+                                         **kwargs)
+                    else:
+                        print(f'reading {filename}', args, kwargs)
+                        try:
+                            # CCDData will find BUNIT again
+                            print('in try')
+                            ccd = super().read(filename, 
+                                               *args,
+                                               unit=bunit,
+                                               **kwargs)
+                            print('after super().read')
+                        except ValueError:
+                            # BUNIT may not be valid
+                            log.warning(f'Potentially invalid BUNIT '
+                                        'value  {bunit} '
+                                        'detected in FITS header')
+                            pass
+            # Here is where we merge our super() ccd property (a
+            # separate object) into the current object
+            self.__dict__.update(ccd.__dict__)
+
+        ## Handle super first to ensure image and meta property are
+        ## installed into the object before we invoke any code later in
+        ## the __init__ that might assume its presence
+        #if unit is None:
+        #    unit = raw_unit
+        #if from_read:
+        #    # Instantiate a new object with the super().read
+        #    # classmethod and copy its property into our current
+        #    # object.  Copying property over rather than just
+        #    # reassigning "self" is necessary because when an object
+        #    # is instantiated, an object reference is created that is
+        #    # permanently associated with the object.  Simple
+        #    # reassignment of self (e.g. self = ccd) does not have the
+        #    # expected effect -- it just changes the place self points
+        #    # to in the routine the assignment was made (e.g.,
+        #    # __init__ in this case) and then when the routine exits,
+        #    # the original "self" is used.  Note also that when we
+        #    # call our super().read method and the object is
+        #    # instantiated, this __init__ is read all over again,
+        #    # since a new object is being created.  Since we don't
+        #    # pass any parameters relevant to the subclass when we do
+        #    # our super().read, all subclass property remains set to
+        #    # the defaults.  When we __dict__.update our local
+        #    # property, we copy over this freshly initialized property
+        #    # to our current property.  Below, we re-initialize the
+        #    # property with the actual keywords we provided to the
+        #    # original .read call
+        #    ccd = super().read(*args, unit=unit, **kwargs)
+        #    self.__dict__.update(ccd.__dict__)
+        #else:
+        #    super().__init__(*args, unit=unit, **kwargs)
         ## Generally the object will calculate these
         #if obj_center is not None:
         #    self.obj_center = obj_center
@@ -280,8 +341,11 @@ class PGData(CCDData):
         self.darktime_key = darktime_key
 
     @classmethod
-    def read(cls, *args, **kwargs):
-        return cls(*args, from_read=True, **kwargs)
+    def read(cls, filename, *args, **kwargs):
+        # Collect our *arg and **kwarg processing in all cases in
+        # __init__.  To do this, we need to encode the filename
+        # somehow.
+        return cls(*args, from_read=filename, **kwargs)
 
     @pgcoordproperty
     def obj_center(self):
@@ -566,8 +630,8 @@ class MaxImPGD(PGData):
 #pgd = PGData()
 fname = '/data/io/IoIO/raw/2020-07-15/HD87696-0016_Na_off.fit'
 #
-class MyPGD(OffsetPGD, CenteredPGD, PGData):
-    pass
+#class MyPGD(OffsetPGD, CenteredPGD, PGData):
+#    pass
 
 #pgd = PGData.read(fname)
 #print(pgd.obj_center, pgd.desired_center)
@@ -610,12 +674,17 @@ class MyPGD(OffsetPGD, CenteredPGD, PGData):
 #pgd.center_offset = (20. -10)
 #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
 
-pgd = MaxPGD.read(fname)
-print(pgd.obj_center)
+#pgd = MaxPGD.read(fname)
+#print(pgd.obj_center)
 class MyPGD(OffsetPGD, MaxPGD):
     pass
-pgd = MyPGD.read(fname, center_offset=(-10,20))
-print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+#pgd = MyPGD.read(fname, center_offset=(-10,20))
+#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+
+bname = '/data/io/IoIO/reduced/Calibration/2020-07-07_ccdT_-10.3_bias_combined.fits'
+pgd = MaxPGD.read(bname)
+
+
 #print(pgd.desired_center)
 
 #
