@@ -11,16 +11,19 @@ import numpy as np
 from scipy.signal import convolve2d
 from scipy.ndimage.measurements import center_of_mass
 
+from astropy import log
 from astropy.io import fits
-from astropy.nddata import CCDData, fits_ccddata_reader
 from astropy import units as u
 from astropy.time import Time
-from astropy.convolution import Gaussian2DKernel
+#from astropy.convolution import Gaussian2DKernel
 
-from IoIO.ccdmultipipe import fallback_unit_ccddata_reader
+from ccdmultipipe import FbuCCDData, fallback_unit_ccddata_reader
 
 _NotFound = object()
 
+#######################
+# Decorators          #
+#######################
 class pgproperty(property):
     """Caching property decorator with auto setting and None reset
 
@@ -48,8 +51,8 @@ class pgproperty(property):
         present, value provided by user.  
         . None: the value is cached without modification
         . 0: value is converted to a numpy array with np.asarray()
-        . tuple: shape of resulting np.array must match tuple or a
-        ValueError is raised
+        . tuple: shape of resulting np.array must match shape_check or
+        a ValueError is raised
 
     Inspired by `astropy.utils.lazyproperty` and `property_manager
     <https://github.com/xolox/python-property-manager>`
@@ -58,22 +61,21 @@ class pgproperty(property):
     complicated multi-inheritance system with inter-connected property
     like `pgdata`, some time savings in calculation of quantities
     could be achieved by caching property at each inheritance level
-    individually, say by making the `key` a string that includes the
-    property name, `self.__class__.__name__` and also the module name
-    just to make sure it is unique.  Then a None reset would only
-    reset the levels from the top down to the MRO at which the
-    property was set to None.  This guarantees the children get a
-    freshly calculated value of the affected properties and
-    acknowledges that the parents don't care that the change was made,
-    since they never depended on the relationship between the property
-    in the first place.  Or if they did, they should be super()ed into
-    the calculation and the most senior setter concerned about the
-    interrelationship would also be calling for the reset of the
-    affected other property.  The side-affect of caching all of the
-    intermediate results would be more memory use, since all of the
-    intermediate property would have long-lived references.  For the
-    pgdata coordiate-oriented stuff, this is not a big deal, but it is
-    not generally appropriate
+    individually, say by making the `key` a MRO level-unique string,
+    e.g. property name, `self.__class__.__name__` and module name.
+    Then a None reset would only reset the levels from the top down to
+    the MRO at which the property was set to None.  This guarantees
+    the children get a freshly calculated value of the affected
+    properties and acknowledges that the parents don't care that the
+    change was made, since they never depended on the relationship
+    between the property in the first place.  Or if they did, they
+    should be super()ed into the calculation and the most senior
+    setter concerned about the interrelationship would also be calling
+    for the reset of the affected other property.  The side-affect of
+    caching all of the intermediate results would be more memory use,
+    since all of the intermediate property would have long-lived
+    references.  For the pgdata coordiate-oriented stuff, this is not
+    a big deal, but it is not generally appropriate.
 
     """
     
@@ -133,6 +135,117 @@ class pgproperty(property):
 class pgcoordproperty(pgproperty):
     shape_check=(2,)
 
+#######################
+# Useful utilities    #
+#######################
+def hist_of_im(im, binsize=1, show=False):
+    """Returns a tuple of the histogram of image and index into *centers* of
+bins."""
+    # Code from west_aux.py, maskgen.
+    # Histogram bin size should be related to readnoise
+    hrange = (im.data.min(), im.data.max())
+    nbins = int((hrange[1] - hrange[0]) / binsize)
+    hist, edges = np.histogram(im, bins=nbins,
+                               range=hrange, density=False)
+    # Convert edges of histogram bins to centers
+    centers = (edges[0:-1] + edges[1:])/2
+    if show:
+        plt.plot(centers, hist)
+        plt.show()
+        plt.close()
+    return (hist, centers)
+
+def iter_linfit(x, y, max_resid=None):
+    """Performs least squares linear fit iteratively to discard bad points
+
+    If you actually know the statistical weights on the points,
+    just use polyfit directly.
+
+    """
+    # Let polyfit report errors in x and y
+    coefs = np.polyfit(x, y, 1)
+    # We are done if we have just two points
+    if len(x) == 2:
+        return coefs
+        
+    # Our first fit may be significantly pulled off by bad
+    # point(s), particularly if the number of points is small.
+    # Construct a repeat until loop the Python way with
+    # while... break to iterate to squeeze bad points out with
+    # low weights
+    last_redchi2 = None
+    iterations = 1
+    while True:
+        # Calculate weights roughly based on chi**2, but not going
+        # to infinity
+        yfit = x * coefs[0] + coefs[1]
+        resid = (y - yfit)
+        if resid.all == 0:
+            break
+        # Add 1 to avoid divide by zero error
+        resid2 = resid**2 + 1
+        # Use the residual as the variance + do the algebra
+        redchi2 = np.sum(1/(resid2))
+        coefs = np.polyfit(x, y, 1, w=1/resid2)
+        # Converge to a reasonable epsilon
+        if last_redchi2 and last_redchi2 - redchi2 < np.finfo(float).eps*10:
+            break
+        last_redchi2 = redchi2
+        iterations += 1
+
+    # The next level of cleanliness is to exclude any points above
+    # max_resid from the fit (if specified)
+    if max_resid is not None:
+        goodc = np.where(np.abs(resid) < max_resid)
+        # Where returns a tuple of arrays!
+        if len(goodc[0]) >= 2:
+            coefs = iter_linfit(x[goodc], y[goodc])
+    return coefs
+    
+def quality_checker(value):
+    if value is None:
+        value = 0
+    if not isinstance(value, int) or value < 0 or value > 10:
+        raise ValueError('quality must be an integer value from 0 to 10')
+    else:
+        return value
+
+#######################
+# Primary Objects     #
+#######################
+class CameraData():
+    camera_data_file = None # some kind of file that would contain this info
+    camera_name = None
+    camera_description = None
+    raw_unit = None
+    unbinned_naxis1 = None
+    unbinned_naxis2 = None
+    satlevel = None
+    nonlinlevel = None
+    gain = None
+    readnoise = None
+    def __init__(self,
+                 camera_data_file=None,
+                 camera_name=None,
+                 camera_description=None,
+                 raw_unit=None,
+                 unbinned_naxis1=None,
+                 unbinned_naxis2=None,
+                 satlevel=None,
+                 nonlinlevel=None,
+                 gain=None,
+                 readnoise=None):
+        camera_data_file = camera_data_file or self.camera_data_file
+        camera_name = camera_name or self.camera_name
+        camera_description = camera_description or self.camera_description
+        raw_unit = raw_unit or self.raw_unit
+        unbinned_naxis1 = unbinned_naxis1 or self.unbinned_naxis1
+        unbinned_naxis2 = unbinned_naxis2 or self.unbinned_naxis2
+        satlevel = satlevel or self.satlevel
+        nonlinlevel = nonlinlevel or self.nonlinlevel
+        gain = gain or self.gain
+        readnoise = readnoise or self.readnoise
+
 class PGCenter():
     """Base class for containing object center and desired center
 
@@ -182,68 +295,21 @@ class PGCenter():
     @quality.setter
     def quality(self, value):
         """Unset quality translates to 0 quality"""
-        if value is None:
-            value = 0
-        if not isinstance(value, int) or value < 0 or value > 10:
-            raise ValueError('quality must be an integer value from 0 to 10')
-        else:
-            return value
-        
+        return quality_checker(value)
+    
     @pgcoordproperty
     def tmid(self):
         pass
 
-class FBUCCDData(CCDData):
-    """
-    Add ``fallback_unit`` capability to :meth:`CCDData.read() <~astropy.nddata.CCDData.read>`
 
-    Paramters
-    ---------
-    filename : str
-        Name of FITS file
-
-    unit : `~astropy.units.Unit`, optional
-        Units of the image data.   If ``None,`` the FITS header
-        ``BUNIT`` keyword will be queried to set the unit.  If that
-        is not found or an error is raised, `fallback_unit` will be
-        used.
-        Default is ``None``.
-
-    fallback_unit : `~astropy.units.Unit`, optional
-        Units to be used for the image data if `unit` is not provided
-        and no valid ``BUNIT`` value is found in the FITS header.
-        Default is ``None``.
-
-    kwargs :
-        Keywords to pass to :meth:`CCDData.read() <~astropy.nddata.CCDData.read>`
-
-    """
-    def __init__(self, *args,
-                 filename=None,
-                 fallback_unit=None,
-                 **kwargs):
-        if filename is not None:
-            ccd = fallback_unit_ccddata_reader(filename, *args, 
-                                               fallback_unit=fallback_unit,
-                                               **kwargs)
-            self.__dict__.update(ccd.__dict__)
-        else:
-            super().__init__(*args, **kwargs)
-
-    @classmethod
-    def read(cls, filename, *args,
-             fallback_unit=None,
-             **kwargs):
-        return cls(*args,
-                   filename=filename, 
-                   fallback_unit=fallback_unit,
-                   **kwargs)
-        #ccd = fallback_unit_ccddata_reader(filename, *args, 
-        #                                   fallback_unit=fallback_unit,
-        #                                   **kwargs)
-        #return ccd
-
-class PGData(CCDData):
+# Pretty much all CCD-like detectors present their raw data in adu.
+# In the event this needed to change for a particular system, insert a
+# subclass redefining fallback_unit anywhere on the PGData inheritance
+# chain.  That fallback_unit will override this one
+class ADU():
+    fallback_unit = 'adu'
+    
+class PGData(ADU, CameraData, FbuCCDData):
     """Base class for image data in the `precisionguide` system
 
     This class stores CCD data using `~astropy.nddata.CCDData` as a
@@ -263,21 +329,18 @@ class PGData(CCDData):
     ----------
 
     """
-
     def __init__(self,
                  *args,
-                 unit=None,
-                 raw_unit='adu',
                  obj_center=None,
                  desired_center=None,
                  quality=0,
+                 recalculate=False,
                  date_obs_key='DATE-OBS',
                  exptime_key='EXPTIME',
                  darktime_key='DARKTIME',
                  **kwargs):
-        if unit is None:
-            unit = raw_unit
-        super().__init__(*args, unit=unit, **kwargs)
+        super().__init__(*args, **kwargs)
+        self.recalculate = recalculate
         self.obj_center = obj_center
         self.desired_center = desired_center
         self.quality = quality
@@ -285,57 +348,57 @@ class PGData(CCDData):
         self.exptime_key = exptime_key
         self.darktime_key = darktime_key
 
-    @classmethod
-    def read(cls, filename, *args, 
-             raw_unit='adu',
-             obj_center=None,
-             desired_center=None,
-             quality=0,
-             date_obs_key='DATE-OBS',
-             exptime_key='EXPTIME',
-             darktime_key='DARKTIME',
-             **kwargs):
-        #ccd = fallback_unit_ccddata_reader(filename, *args,
-        ccd = FBUCCDData.read(filename, *args, 
-                              fallback_unit=raw_unit,
-                              **kwargs)
-        # Make a vestigial pgd
-        pgd = cls(ccd.data,
-                  unit=ccd.unit,
-                  obj_center=obj_center,
-                  desired_center=desired_center,
-                  quality=quality,
-                  date_obs_key=date_obs_key,
-                  exptime_key=exptime_key,
-                  darktime_key=darktime_key)
-        # Merge in ccd property
-        pgd.__dict__.update(ccd.__dict__)
-        return pgd
-
+        self._invalid_obj_center = (-99, -99)
+        self._invalid_desired_center = (-99, -99)
+        self._invalid_quality = False#-1
+        
     @pgcoordproperty
     def obj_center(self):
-        # Here is our fancy calculation that takes a long time.
-        # DESIGN NOTE: obj_center and desired_center use 
-        # the pgproperty system so that they can be set to an
-        # arbitrary value at any time.  Recalculation is triggered by 
-        # and stored as an np.array without recalculation.  In
-        # other words, we calculate just once but we enable 
-        obj_center = np.asarray((-99, -99))
+        """Center of object, (Y, X).  Quality of center determination must be
+    set as well.  Base class uses out-of-bounds value (-99, -99) for
+    center and 0 for quality
+
+        Results are stored using the :class:`pgcoordproperty`
+        decorator system.  See documentation of that class for
+        explanation of features.
+
+        """
+        obj_center = (-99, -99)
         self.quality = 0
         return obj_center
 
     @pgcoordproperty
     def desired_center(self):
+        """Desired center of object (Y, X).  Base class uses center of
+    data array.
+
+        Results are stored using the :class:`pgcoordproperty`
+        decorator system.  See documentation of that class for
+        explanation of features.
+
+        """
         # Here is where the complicated desired_center calculation is
         # done:
-        return np.asarray(self.data.shape)/2
+        npshape = np.asarray(self.data.shape)
+        desired_center = npshape/2
+        return desired_center
 
     @pgproperty
     def quality(self):
+        """Quality of center determination.  Quality should always be
+    set in the obj_center setter"""
         self.obj_center
+
+    @quality.setter
+    def quality(self, value):
+        """Unset quality translates to 0 quality"""
+        # check for self._invalid_quality
+        if value:
+            return quality_checker(value)
 
     @pgproperty
     def tmid(self):
+        """`~astropy.time.Time` at midpoint of observation"""
         tmid_str = self.meta.get('tmid')
         if tmid_str is not None:
             return Time(tmid_str, format='fits')
@@ -358,39 +421,51 @@ class PGData(CCDData):
         if not isinstance(val, Time):
             raise ValueError('tmid must be of type `~astropy.time.Time`')
 
-    @property
+    @pgcoordproperty
     def binning(self):
-        """Image binning in Y,X order"""
-        # Note, this needs to be overwritten with the actual FITS
-        # binning keywords used (which are unfortunately not in any
-        # FITS standard).  E.g.:
-        #binning = np.asarray((self.meta['YBINNING'],
-        #                      self.meta['XBINNING']))
+        """Image binning in Y,X order.
+
+         NOTE: this needs to be overridden in a subclass with the
+         actual FITS binning keywords used (which are unfortunately
+         not in any FITS standard).  E.g.:
+         >>> binning = (self.meta['YBINNING'],
+         >>>            self.meta['XBINNING'])
+         >>> return binning
+        """
         binning = (1,1)
-        return np.asarray(binning)
+        return binning
         
-    @property
+    @pgcoordproperty
     def subframe_origin(self):
-        """Subframe origin in *unbinned* pixels with full CCD origin = (0,0).  Y,X order"""
-        #subframe_origin = np.asarray((self.meta['YORGSUBF'],
-        #                              self.meta['XORGSUBF']))
-        #subframe_origin *= self.binning
+        """Subframe origin in *unbinned* pixels with full CCD origin =
+    (0,0).  Y,X order
+         NOTE: this needs to be overridden in a subclass with the
+         actual FITS binning keywords used (which are unfortunately
+         not in any FITS standard).  E.g.:
+         >>> subframe_origin = (self.meta['YORGSUBF'],
+         >>>                    self.meta['XORGSUBF'])
+         >>> subframe_origin = np.asarray(subframe_origin)
+         >>> subframe_origin *= self.binning
+         >>> return subframe_origin
+        """
         subframe_origin = (0,0)
-        return np.asarray(subframe_origin)
+        return subframe_origin
 
     def unbinned(self, coords):
         """Returns coords referenced to full CCD given internally stored binning/subim info"""
         coords = np.asarray(coords)
-        return np.asarray(self.binning * coords + self.subframe_origin)
+        return self.binning * coords + self.subframe_origin
 
     def binned(self, coords):
         """Assuming coords are referenced to full CCD, return location in binned coordinates relative to the subframe origin"""
         coords = np.asarray(coords)
-        return np.asarray((coords - self.subframe_origin) / self.binning)
+        return (coords - self.subframe_origin) / self.binning
         
     def im_unbinned(self, a):
         """Returns an unbinned version of a.  a must be same shape as data
         """
+        if a is None:
+            return None
         assert a.shape == self.data.shape
         # Don't bother if we are already unbinned
         if np.sum(self.binning) == 2:
@@ -415,30 +490,63 @@ class PGData(CCDData):
         return unbinned
 
     @pgproperty
-    def data_unbinned(self):
-        """Returns an unbinned version of data
+    def self_unbinned(self):
+        """Returns an unbinned version of this object.  NOTE: just as with the
+    primary object, if this object needs to be modified, it should be
+    copied first, particularly since, in the case the image is not
+    binned, it might just point to self
+
         """
-        return self.im_unbinned(self.data)
+        if (self.binning.sum() == 2
+            and self.subframe_origin.sum() == 0):
+            # We are already unbinned, don't bother to copy
+            return self
+        # If we made it here, we need to unbin
+        self_unbinned = self.copy()
+        self_unbinned.data = im_unbinned(self.data)
+        self_unbinned.mask = im_unbinned(self.mask)
+        self_unbinned.uncertainty = im_unbinned(self.uncertainty)
+        self_unbinned.binning = np.asarray((1,1))
+        self_unbinned.subframe_origin = np.asarray((0,0))
+        return self_unbinned
 
     @property
     def pgcenter(self):
+        """Returns a :class:`PGCenter` object with the *unbinned* obj and
+    desired center coordinates.  Working in *unbinned* coordinates is
+    essential for the internal workings of the precisionguide
+    telescope control system, but rather confusing and abstract for
+    the user in any other context.
+
+        """
+        # I may want to also export the binning information for
+        # display purposes in precisionguide
         return PGCenter(self.unbinned(self.obj_center),
                         self.unbinned(self.desired_center),
                         self.quality,
                         self.tmid)
 
     def _card_write(self):
+        """Writes FITS header cards for obj and desired center coordinates in
+        *binned* coordinates (i.e., as they would likely presesnt in
+        image analysis software showing the image)
+
+        """
         # Note pythonic y, x coordinate ordering
+        self.meta['OBJ_CR0'] = (self.obj_center[1], 'Calculated object '
+                                'center X')
+        self.meta['OBJ_CR1'] = (self.obj_center[0], 'Calculated object '
+                                'center Y')
         self.meta['DES_CR0'] = (self.desired_center[1], 'Desired center X')
         self.meta['DES_CR1'] = (self.desired_center[0], 'Desired center Y')
-        self.meta['OBJ_CR0'] = (self.obj_center[1], 'Object center X')
-        self.meta['OBJ_CR1'] = (self.obj_center[0], 'Object center Y')
-        self.meta['QUALITY'] = (self.quality, 'Quality on 0-10 scale of center determination')
-        self.meta['QUALITY'] = (self.quality, 'Quality on 0-10 scale of center determination')
-        self.meta.insert('DATE-OBS',
-                         ('TMID', self.tmid.value,
-                          'midpoint of exposure, UT'),
-                         after=True)
+        self.meta['HIERARCH CENTER_QUALITY'] = (self.quality,
+                                                'Quality on 0-10 scale '
+                                                'of center determination')
+        if not self.meta.get('TMID'):
+            self.meta.insert('DATE-OBS',
+                             ('TMID', self.tmid.value,
+                              'midpoint of exposure, UT'),
+                             after=True)
 
     def write(self, *args, **kwargs):
         self._card_write()
@@ -448,6 +556,153 @@ class NoCenterPGD(PGData):
     """Sets :prop:`obj_center` to invalid value and :prop:`quality` to 0`"""
     pass
 
+class FITSReaderPGD(PGData):
+    """Read FITS keys to set defaults"""
+
+    ## Inefficient way -- FITS header is read each time object is
+    ## initialized even if it never uses the property
+    #def __init__(self, *args,
+    #             obj_center=None,
+    #             desired_center=None,
+    #             quality=0,
+    #             recalculate=False,
+    #             **kwargs):
+    #    super().__init__(*args, **kwargs)
+    #    try:
+    #        assert not recalculate, ('Recalculation requested')
+    #        log.debug('Trying to read center info from FITS header,')
+    #        cx = self.meta['OBJ_CR0']
+    #        cy = self.meta['OBJ_CR1']
+    #        dx = self.meta['DES_CR0']
+    #        dy = self.meta['DES_CR1']
+    #        q = self.meta['CENTER_QUALITY']
+    #        tmid_str = self.meta['TMID']
+    #        self.obj_center = (cy, cx)
+    #        self.desired_center = (dy, dx)
+    #        self.quality = q
+    #        self.tmid = Time(tmid_str, format='fits')
+    #        log.info('Center info set from FITS header, use '
+    #                 'recalculate=True to avoid')
+    #    except Exception as e:
+    #        log.debug(str(e))
+    #        log.debug('Setting obj_center, desired_center, and quality '
+    #                  'from object instantiation keywords')
+    #        self.obj_center = obj_center
+    #        self.desired_center = desired_center
+    #        self.quality = quality
+
+    @pgproperty
+    def obj_center(self):
+        """Center of object, (Y, X).  Quality of center determination must be
+    set as well.  Base class uses out-of-bounds value (-99, -99) for
+    center and 0 for quality
+
+        Results are stored using the :class:`pgcoordproperty`
+        decorator system.  See documentation of that class for
+        explanation of features.
+
+        """
+        try:
+            assert not self.recalculate, ('Recalculation requested')
+            log.debug('Trying to read center info from FITS header,')
+            cx = self.meta['OBJ_CR0']
+            cy = self.meta['OBJ_CR1']
+            obj_center = np.asarray((cy, cx))
+        except Exception as e:
+            log.debug(str(e))
+            log.debug('Not setting center from FITS header,')
+            obj_center = None
+            self.quality = None
+        return obj_center
+
+    @pgproperty
+    def desired_center(self):
+        """Desired center of object (Y, X).  Base class uses center of
+    data array.
+
+        Results are stored using the :class:`pgcoordproperty`
+        decorator system.  See documentation of that class for
+        explanation of features.
+
+        """
+        try:
+            assert not self.recalculate, ('Recalculation requested')
+            log.debug('Trying to read desired center info from FITS header,')
+            dx = self.meta['DES_CR0']
+            dy = self.meta['DES_CR1']
+            desired_center = np.asarray((dy, dx))
+        except Exception as e:
+            log.debug(str(e))
+            log.debug('Not setting desired center from FITS header,')
+            desired_center = None
+        return desired_center
+
+    @pgproperty
+    def quality(self):
+        """Quality of center determination.  Quality should always be
+    set in the obj_center setter"""
+        try:
+            assert not self.recalculate, ('Recalculation requested')
+            log.debug('Trying to read quality info from FITS header,')
+            q = self.meta['CENTER_QUALITY']
+            return int(q)
+        except Exception as e:
+            log.debug(str(e))
+            log.debug('Not setting quality from FITS header,')
+            # obj_center should set quality
+            self.obj_center
+
+    @quality.setter
+    def quality(self, value):
+        """Unset quality translates to 0 quality"""
+        if value:
+            value = quality_checker(value)
+        return value
+
+class Ex(PGData):
+    @pgcoordproperty
+    def obj_center(self):
+        # Pattern for all that want to read the FITS
+        print('in obj_center')
+        t = super().obj_center
+        return t
+
+class ExampleFITSReaderPGD(FITSReaderPGD):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        print('in init')              
+
+    @pgcoordproperty
+    def obj_center(self):
+        # Pattern for all that want to read the FITS
+        t = FITSReaderPGD(self).obj_center
+        if  t is not None:
+            return t
+        # Real calculation starts here
+        obj_center = self.desired_center
+        self.quality = 10
+        return obj_center
+
+    @pgcoordproperty
+    def desired_center(self):
+        # Pattern for all that want to read the FITS
+        t = FITSReaderPGD(self).desired_center
+        if t is not None:
+            return t
+        # Real calculation starts here
+        npshape = np.asarray(self.shape)
+        desired_center = npshape/2
+        return desired_center
+    
+    @pgproperty
+    def quality(self):
+        # Pattern for all that want to read the FITS
+        t = FITSReaderPGD(self).quality
+        if t is not None:
+            return t
+        self.obj_center
+    
+
 class CenteredPGD(PGData):
     """Sets :prop:`obj_center` to :prop:`desired_center`"""
 
@@ -455,7 +710,6 @@ class CenteredPGD(PGData):
         super().__init__(*args, **kwargs)
         self._old_desired_center = None
     
-
     @pgcoordproperty
     def obj_center(self):
         self.quality = 10
@@ -494,7 +748,6 @@ class OffsetPGD(PGData):
             center_offset = (0,0)
         self._old_center_offset = center_offset
         self.center_offset = center_offset
-        #self._center_offset = np.asarray(center_offset)
 
     @pgcoordproperty
     def _old_center_offset(self):
@@ -520,13 +773,50 @@ class OffsetPGD(PGData):
     def obj_center(self):
         return super().obj_center + self.center_offset
 
+    def _card_write(self):
+        """Writes FITS header cards in *binned* coordinates (i.e., as they
+would likely presesnt in image analysis software showing the image)
+
+        """
+        # Note pythonic y, x coordinate ordering
+        self.meta['OFF_CR0'] = (self.center_offset[1], 'Offset from '
+                                'orig obj center X')
+        self.meta['OFF_CR1'] = (self.center_offset[0], 'Offset from '
+                                'orig obj center Y')
+        super()._card_write()
+
 class MaxPGD(PGData):
     @pgcoordproperty
     def obj_center(self):
         self.quality = 6
         obj_center = np.unravel_index(np.argmax(self), self.shape)
-        return np.asarray(obj_center)
-    
+        return obj_center
+
+# --> Still working on this.  Looks like I am going to need a
+# readnoise property in the object if I really want to do this.  Maybe
+# we need a readnoise_keyword or something like that....  Very camera
+# specific
+class BackgroundPGD(PGData):
+    """Hold background.  Might need this to expand to hold other
+    things.  Util is a bit too general a name, but that is sort of
+    what I would envision"""
+
+    @pgproperty
+    def background(self):
+        return np.median(self)
+
+class CenterOfMassPGD(BackgroundPGD):
+    """Use simple center-of-mass calculation to find center of
+    brightest object.  Works best if pixels not likely to be part of
+    the source are set to zero."""
+
+    @pgcoordproperty
+    def obj_center(self):
+        #bsub = self.subtract(self.background, handle_meta='first_found')
+        #return center_of_mass(bsub.data)
+        bsub = self.data - self.background
+        return center_of_mass(bsub)
+
 class BrightestPGD(PGData):
     def __init__(self, *args,
                  seeing=2,
@@ -542,16 +832,6 @@ class BrightestPGD(PGData):
         # Still working on this
         return super().obj_center + self.center_offset
     
-class CenterOfMassPGD(PGData):
-    """Use simple center-of-mass calculation to find center of
-    brightest object.  Works best if pixels not likely to be part of
-    the source are set to zero."""
-
-    @pgcoordproperty
-    def obj_center(self):
-        # Still working on this
-        return super().obj_center + self.center_offset
-
 class MaxImPGD(PGData):
     """Handles MaxIM DL :prop:`binning` and :prop:`subframe_origin`"""
 
@@ -569,10 +849,12 @@ class MaxImPGD(PGData):
         """Subframe origin in *unbinned* pixels with full CCD origin = (0,0).  Y,X order"""
         subframe_origin = (self.meta['YORGSUBF'],
                            self.meta['XORGSUBF'])
-        subframe_origin = np.asarray(subframe_origin) * self.binning
+        subframe_origin = np.asarray(subframe_origin)
+        subframe_origin *= self.binning
         return subframe_origin
 
     def _card_write(self):
+        """Write FITS card unique to MaxIMPGD"""
         # Note pythonic y, x coordinate ordering
         self.meta['XBINNING'] = self.binning[1]
         self.meta['YBINNING'] = self.binning[0]
@@ -584,121 +866,170 @@ class MaxImPGD(PGData):
         self._card_write()
         super().write(*args, **kwargs)
 
-#pgc = PGCenter()
-#pgc.obj_center = (1,1)
-#print(pgc.obj_center)
-##pgc.obj_center = 1
-##pgc = PGCenter((1,2), (3,4))
-#pgc = PGCenter([1,2], (3,4))
-#print(pgc.obj_center, pgc.desired_center)
+if __name__ == "__main__":
+    log.setLevel('DEBUG')
+    #pgc = PGCenter()
+    #pgc.obj_center = (1,1)
+    #print(pgc.obj_center)
+    ##pgc.obj_center = 1
+    ###pgc = PGCenter((1,2), (3,4))
+    #pgc = PGCenter([1,2], (3,4))
+    #print(pgc.obj_center, pgc.desired_center)
 
-#pgd = PGData()
-fname = '/data/io/IoIO/raw/2020-07-15/HD87696-0016_Na_off.fit'
-#
-#class MyPGD(OffsetPGD, CenteredPGD, PGData):
-#    pass
+    #pgd = PGData()
+    fname = '/data/io/IoIO/raw/2020-07-15/HD87696-0016_Na_off.fit'
+    
+    class MyPGD(OffsetPGD, CenteredPGD, PGData):
+        pass
 
-#pgd = PGData.read(fname)
-#print(pgd.obj_center, pgd.desired_center)
-#pgd.obj_center = (1,1)
-#print(pgd.obj_center, pgd.desired_center)
-#pgd = PGData.read(fname, obj_center=(2,2))
-#print(pgd.obj_center, pgd.desired_center)
-#pgd.desired_center = (1,1)
-#print(pgd.obj_center, pgd.desired_center)
-#del pgd.desired_center
-#print(pgd.obj_center, pgd.desired_center)
-#pgd.obj_center = None
-#print(pgd.obj_center, pgd.desired_center)
-#pgd = MyPGD.read(fname)
-#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
-#pgd.center_offset += np.asarray((10, -10))
-#pgd.center_offset += (10, -10)
-#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
-#pgd.center_offset = None
-#pgd.desired_center = (3,3)
-#pgd.center_offset += (10, -30)
-###pgd.center_offset = (10, -10)
-#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
-#pgd.obj_center = (0,0)
-#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
-#pgd.obj_center = None
-##del pgd.obj_center
-##pgd.calculated_center = (0,0)
-#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
-#pgd.center_offset = pgd.center_offset + (10, -10)
-#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
-#pgd.center_offset += (10, -30)
-#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd = PGData.read(fname)
+    #print(pgd.obj_center, pgd.desired_center)
+    #pgd.obj_center = (1,1)
+    #print(pgd.obj_center, pgd.desired_center)
+    #pgd = PGData.read(fname, obj_center=(2,2))
+    #print(pgd.obj_center, pgd.desired_center)
+    #pgd.desired_center = (1,1)
+    #print(pgd.obj_center, pgd.desired_center)
+    #del pgd.desired_center
+    #print(pgd.obj_center, pgd.desired_center)
+    #pgd.obj_center = None
+    #print(pgd.obj_center, pgd.desired_center)
+    #
+    #pgd = CenteredPGD.read(fname)
+    #print(pgd.obj_center, pgd.desired_center)
+    #
+    #pgd = MyPGD.read(fname)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd.center_offset += np.asarray((10, -10))
+    #pgd.center_offset += (10, -10)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd.center_offset = None
+    #pgd.desired_center = (3,3)
+    #pgd.center_offset += (10, -30)
+    #pgd.center_offset = (10, -10)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd.obj_center = (0,0)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd.obj_center = None
+    ##del pgd.obj_center
+    ###pgd.calculated_center = (0,0)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd.center_offset = pgd.center_offset + (10, -10)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd.center_offset += (10, -30)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd.write('/tmp/testfits.fits', overwrite=True)
 
-#pgd.obj_center = (1,1)
-#pgd.desired_center = (1,1)
-#print(pgd.obj_center, pgd.desired_center)
-#del pgd.desired_center
-#print(pgd.obj_center, pgd.desired_center)
-#pgd.center_offset = (20. -10)
-#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #class MyPGD(OffsetPGD, CenteredPGD, PGData):
+    #    pass
+    #pgd = MyPGD.read(fname)
+    #pgd.center_offset += (10, -30)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd.write('/tmp/testfits.fits', overwrite=True)
 
-#pgd = MaxPGD.read(fname)
-#print(pgd.obj_center)
-class MyPGD(OffsetPGD, MaxPGD):
-    pass
-#pgd = MyPGD.read(fname, center_offset=(-10,20))
-#print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd = MyPGD(pgd)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd = MyPGD(pgd.data)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
 
-bname = '/data/io/IoIO/reduced/Calibration/2020-07-07_ccdT_-10.3_bias_combined.fits'
-bpgd = MyPGD.read(bname)
-epgd = MyPGD.read(bname, unit='adu')
-#ccd = FBUCCDData.read(bname)
+    #pgd = Ex.read(fname)
+    #print(pgd.obj_center, pgd.desired_center)
 
-pgd = MyPGD.read(fname)
+    #pgd = FITSReaderPGD.read('/tmp/testfits.fits')
+    #print(pgd.obj_center, pgd.desired_center)
+    #
+    #pgd = ExampleFITSReaderPGD.read('/tmp/testfits.fits')
+    #print(pgd.obj_center, pgd.desired_center, pgd.quality)    
+    #
+    #pgd = ExampleFITSReaderPGD.read(fname)
+    #print(pgd.obj_center, pgd.desired_center, pgd.quality)    
+
+    pgd = CenterOfMassPGD.read(fname)
+    print(pgd.obj_center, pgd.desired_center, pgd.quality)        
+
+    off_filt = '/data/io/IoIO/raw/2018-01-28/R-band_off_ND_filter.fit'
+    pgd = CenterOfMassPGD.read(off_filt) 
+    print(pgd.obj_center, pgd.desired_center, pgd.quality)        
+
+    #pgd.obj_center = (1,1)
+    #pgd.desired_center = (1,1)
+    #print(pgd.obj_center, pgd.desired_center)
+    #del pgd.desired_center
+    #print(pgd.obj_center, pgd.desired_center)
+    #pgd.center_offset = (20. -10)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+
+    #log.setLevel('DEBUG')
+    #pgd = MaxPGD.read(fname)
+    #print(pgd.obj_center)
+    #wname = '/tmp/test_kwd_write.fits'
+    #pgd.write(wname, overwrite=True)
+    #pgd = MaxPGD.read(wname)
+    #print(pgd.obj_center, pgd.desired_center)
+    #pgd = PGData.read(wname, recalculate=True)
+    #print(pgd.obj_center, pgd.desired_center)
+    #class MyPGD(OffsetPGD, MaxPGD):
+    #    pass
+    ##pgd = MyPGD.read(fname, center_offset=(-10,20))
+    ##print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #
+    #bname = '/data/io/IoIO/reduced/Calibration/2020-07-07_ccdT_-10.3_bias_combined.fits'
+    #bpgd = MyPGD.read(bname)
+    #epgd = MyPGD.read(bname, unit='adu')
+    #ccd = FbuCCDData.read(bname)
+
+    #pgd = MyPGD.read(fname)
 
 
-#print(pgd.desired_center)
+    #print(pgd.desired_center)
 
-#
-#ccd = CCDData.read(fname, unit='adu')
-#
-#rpgd = PGData(ccd.data, meta=ccd.meta)
-#print(pgd.desired_center)
-#
-#pgd = PGData.read(fname)
-#print(pgd.desired_center)
-#
-#pgd = PGData.read(fname, desired_center=(2,2))
-#print(pgd.desired_center)
-#
-#dspgd = PGData.read(fname, desired_center=(100,100))
-#print(dspgd.obj_center, dspgd.desired_center)
-#
-#dspgd.write('/tmp/test.fits', overwrite=True)
-#
-#pgdc = PGDCentered.read(fname)
-#print(pgdc.obj_center, pgdc.desired_center)
-#
-#pgdo = PGDOffset.read(fname)
-#print(pgdo.obj_center, pgdo.desired_center)
-#
-#pgdo = PGDOffset(pgd.data, meta=pgd.meta, center_offset=(20,10))
-#print(pgdo.obj_center, pgdo.desired_center)
-#
-#pgdo = PGDOffset.read(fname, center_offset=(20,10))
-#print(pgdo.obj_center, pgdo.desired_center)
-#
-#class MyPGD(PGDOffset, PGDCentered):
-#    pass
-#
-#mpgd = MyPGD.read(fname, center_offset=(20,10))
-#print(mpgd.obj_center, mpgd.desired_center)
-#
-#print('done')
+    #
+    #ccd = CCDData.read(fname, unit='adu')
+    #
+    #rpgd = PGData(ccd.data, meta=ccd.meta)
+    #print(pgd.desired_center)
+    #
+    #pgd = PGData.read(fname)
+    #print(pgd.desired_center)
+    #
+    #pgd = PGData.read(fname, desired_center=(2,2))
+    #print(pgd.desired_center)
+    #
+    #dspgd = PGData.read(fname, desired_center=(100,100))
+    #print(dspgd.obj_center, dspgd.desired_center)
+    #
+    #dspgd.write('/tmp/test.fits', overwrite=True)
+    #
+    #pgdc = PGDCentered.read(fname)
+    #print(pgdc.obj_center, pgdc.desired_center)
+    #
+    #pgdo = PGDOffset.read(fname)
+    #print(pgdo.obj_center, pgdo.desired_center)
+    #
+    #pgdo = PGDOffset(pgd.data, meta=pgd.meta, center_offset=(20,10))
+    #print(pgdo.obj_center, pgdo.desired_center)
+    #
+    #pgdo = PGDOffset.read(fname, center_offset=(20,10))
+    #print(pgdo.obj_center, pgdo.desired_center)
+    #
+    #class MyPGD(PGDOffset, PGDCentered):
+    #    pass
+    #
+    #mpgd = MyPGD.read(fname, center_offset=(20,10))
+    #print(mpgd.obj_center, mpgd.desired_center)
+    #
+    #print('done')
 
-bname = '/data/io/IoIO/reduced/Calibration/2020-07-07_ccdT_-10.3_bias_combined.fits'
-#ccd = CCDData.read(bname)
+    #bname = '/data/io/IoIO/reduced/Calibration/2020-07-07_ccdT_-10.3_bias_combined.fits'
+    ##ccd = CCDData.read(bname)
+    #
+    #fname1 = '/data/Mercury/raw/2020-05-27/Mercury-0005_Na-on.fit'
+    ##ccd = CCDData.read(fname1)
+    #ccd = FbuCCDData.read(fname1, fallback_unit='adu')
+    ##ccd = FbuCCDData.read(fname1, fallback_unit='aduu')
+    #
+    #ccd = FbuCCDData.read(fname1, unit='electron')
 
-fname1 = '/data/Mercury/raw/2020-05-27/Mercury-0005_Na-on.fit'
-#ccd = CCDData.read(fname1)
-ccd = FBUCCDData.read(fname1, fallback_unit='adu')
-#ccd = FBUCCDData.read(fname1, fallback_unit='aduu')
-
-ccd = FBUCCDData.read(fname1, unit='electron')
+    #fname1 = '/data/Mercury/raw/2020-05-27/Mercury-0005_Na-on.fit'
+    #pgd = CenterOfMassPGD.read(fname1)
+    #print(pgd.obj_center, pgd.desired_center)

@@ -3,7 +3,7 @@
 import sys
 
 if sys.platform == 'win32':
-    from win32.py import *
+    from .win32 import *
 
-from pgdata import *
+from .pgdata import *
 
