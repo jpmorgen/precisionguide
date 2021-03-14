@@ -17,7 +17,7 @@ from astropy import units as u
 from astropy.time import Time
 #from astropy.convolution import Gaussian2DKernel
 
-from ccdmultipipe import FbuCCDData, fallback_unit_ccddata_reader
+from ccdmultipipe import FbuCCDData
 
 _NotFound = object()
 
@@ -213,39 +213,6 @@ def quality_checker(value):
 #######################
 # Primary Objects     #
 #######################
-class CameraData():
-    camera_data_file = None # some kind of file that would contain this info
-    camera_name = None
-    camera_description = None
-    raw_unit = None
-    unbinned_naxis1 = None
-    unbinned_naxis2 = None
-    satlevel = None
-    nonlinlevel = None
-    gain = None
-    readnoise = None
-    def __init__(self,
-                 camera_data_file=None,
-                 camera_name=None,
-                 camera_description=None,
-                 raw_unit=None,
-                 unbinned_naxis1=None,
-                 unbinned_naxis2=None,
-                 satlevel=None,
-                 nonlinlevel=None,
-                 gain=None,
-                 readnoise=None):
-        camera_data_file = camera_data_file or self.camera_data_file
-        camera_name = camera_name or self.camera_name
-        camera_description = camera_description or self.camera_description
-        raw_unit = raw_unit or self.raw_unit
-        unbinned_naxis1 = unbinned_naxis1 or self.unbinned_naxis1
-        unbinned_naxis2 = unbinned_naxis2 or self.unbinned_naxis2
-        satlevel = satlevel or self.satlevel
-        nonlinlevel = nonlinlevel or self.nonlinlevel
-        gain = gain or self.gain
-        readnoise = readnoise or self.readnoise
-
 class PGCenter():
     """Base class for containing object center and desired center
 
@@ -301,15 +268,107 @@ class PGCenter():
     def tmid(self):
         pass
 
-
 # Pretty much all CCD-like detectors present their raw data in adu.
 # In the event this needed to change for a particular system, insert a
-# subclass redefining fallback_unit anywhere on the PGData inheritance
-# chain.  That fallback_unit will override this one
+# subclass redefining raw_unit anywhere on the CameraData/PGData
+# inheritance chain.  That raw_unit will override this one.  Note,
+# doing this as a class variable is necessary because of the CCDData
+# read classmethod
 class ADU():
-    fallback_unit = 'adu'
-    
-class PGData(ADU, CameraData, FbuCCDData):
+    raw_unit = u.adu
+
+
+# Although CameraData is intended to be for containing just camera
+# information, make it a subclass of FbuCCDData so that the raw_unit
+# can be properly inserted when CCD images are read in.
+
+# I envision either the camera file being use with a camera name and
+# method to initialize all of the propriety, or just a new class being
+# prepared that has the property hand-coded as class variables
+class CameraData(FbuCCDData):
+    raw_unit = u.adu
+    camera_data_file = None # some kind of file that would contain this info
+    camera_name = None
+    camera_description = None
+    full_naxis1 = None
+    full_naxis2 = None
+    satlevel = None
+    nonlinlevel = None
+    gain = None
+    readnoise = None
+
+    def __init__(self,
+                 *args,
+                 camera_data_file=None,
+                 camera_name=None,
+                 camera_description=None,
+                 raw_unit=None, # This will not affect the read classmethod
+                 full_naxis1=None,
+                 full_naxis2=None,
+                 satlevel=None,
+                 nonlinlevel=None,
+                 gain=None,
+                 readnoise=None,
+                 **kwargs):
+        self.camera_data_file = camera_data_file or self.camera_data_file
+        self.camera_name = camera_name or self.camera_name
+        self.camera_description = camera_description or self.camera_description
+        self.raw_unit = raw_unit or self.raw_unit
+        self.full_naxis1 = full_naxis1 or self.full_naxis1
+        self.full_naxis2 = full_naxis2 or self.full_naxis2
+        self.satlevel = satlevel or self.satlevel
+        self.nonlinlevel = nonlinlevel or self.nonlinlevel
+        self.gain = gain or self.gain
+        self.readnoise = readnoise or self.readnoise
+        super().__init__(*args, fallback_unit=self.raw_unit, **kwargs)
+
+    @classmethod
+    def read(cls, filename, 
+             raw_unit=None,
+             **kwargs):
+        """Use ``raw_unit`` instead of ``fallback_unit``."""
+        raw_unit = raw_unit or cls.raw_unit
+        return super(CameraData, cls).read(filename,
+                                       fallback_unit=raw_unit,
+                                       **kwargs)
+
+    def _card_write(self):
+        """Write FITS header cards for camera
+
+        """
+        self.meta['GAIN'] = (self.gain, f'CCD charge gain '
+                             '{self.gain.unit.to_str()}')
+        self.meta['SATLEVEL'] = (self.satlevel, f'CCD saturation level '
+                                 '{self.satlevel.unit.to_str()}')
+        self.meta['NONLIN'] = (self.nonlinlevel, f'CCD nonlinearity '
+                               'level {self.nonlinlevel.unit.to_str()}')
+        self.meta['RDNOISE'] = (self.readnoise, f'CCD readnoise '
+                               'level {self.readnoise.unit.to_str()}')
+
+class SX694(CameraData):
+    camera_name = 'SX694'
+    camera_description = 'Starlight Xpress Trius SX694 mono, 2017 model version'
+    raw_unit = u.adu
+    # naxis1 = fastest changing axis in FITS primary image = X in
+    # Cartesian thought
+    # naxis1 = next to fastest changing axis in FITS primary image = Y in
+    # Cartesian thought
+    full_naxis1 = 2750*u.pix
+    full_naxis2 = 2200*u.pix
+    # 16-bit A/D converter
+    satlevel = (2**16-1)*raw_unit
+    nonlinlevel = (42000 - 1811)*raw_unit
+    # Gain measured in /data/io/IoIO/observing/Exposure_Time_Calcs.xlsx.
+    # Value agrees well with Trius SX-694 advertised value (note, newer
+    # "PRO" model has a different gain value).  Stored in GAIN keyword
+    gain = 0.3 * u.electron/raw_unit
+    # Sample readnoise measured as per ioio.notebk
+    # Tue Jul 10 12:13:33 2018 MCT jpmorgen@byted 
+    # Readnoies is measured regularly as part of master bias creation and
+    # stored in the RDNOISE keyword.  This is used as a sanity check.
+    readnoise = 15.475665*raw_unit
+
+class PGData(CameraData):
     """Base class for image data in the `precisionguide` system
 
     This class stores CCD data using `~astropy.nddata.CCDData` as a
@@ -351,7 +410,7 @@ class PGData(ADU, CameraData, FbuCCDData):
         self._invalid_obj_center = (-99, -99)
         self._invalid_desired_center = (-99, -99)
         self._invalid_quality = False#-1
-        
+
     @pgcoordproperty
     def obj_center(self):
         """Center of object, (Y, X).  Quality of center determination must be
@@ -547,6 +606,7 @@ class PGData(ADU, CameraData, FbuCCDData):
                              ('TMID', self.tmid.value,
                               'midpoint of exposure, UT'),
                              after=True)
+        super()._card_write()
 
     def write(self, *args, **kwargs):
         self._card_write()
@@ -895,9 +955,9 @@ if __name__ == "__main__":
     #pgd.obj_center = None
     #print(pgd.obj_center, pgd.desired_center)
     #
-    #pgd = CenteredPGD.read(fname)
-    #print(pgd.obj_center, pgd.desired_center)
-    #
+    pgd = CenteredPGD.read(fname)
+    print(pgd.obj_center, pgd.desired_center)
+    
     #pgd = MyPGD.read(fname)
     #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
     #pgd.center_offset += np.asarray((10, -10))
@@ -921,16 +981,17 @@ if __name__ == "__main__":
     #pgd.write('/tmp/testfits.fits', overwrite=True)
 
     #class MyPGD(OffsetPGD, CenteredPGD, PGData):
-    #    pass
+    class MyPGD(OffsetPGD, CenteredPGD, MaxImPGD, SX694):
+        pass
     #pgd = MyPGD.read(fname)
     #pgd.center_offset += (10, -30)
     #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
     #pgd.write('/tmp/testfits.fits', overwrite=True)
 
-    #pgd = MyPGD(pgd)
-    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
-    #pgd = MyPGD(pgd.data)
-    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    pgd = MyPGD(pgd)
+    print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    pgd = MyPGD(pgd.data)
+    print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
 
     #pgd = Ex.read(fname)
     #print(pgd.obj_center, pgd.desired_center)
