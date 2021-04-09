@@ -8,200 +8,116 @@ code.
 
 """
 import numpy as np
-from scipy.signal import convolve2d
-from scipy.ndimage.measurements import center_of_mass
 
 from astropy import log
 from astropy.io import fits
 from astropy import units as u
 from astropy.time import Time
+from astropy.nddata import NDArithmeticMixin
 #from astropy.convolution import Gaussian2DKernel
 
 from ccdmultipipe import FbuCCDData
 
-_NotFound = object()
+from .decorators import pgproperty, pgcoordproperty
 
-#######################
-# Decorators          #
-#######################
-class pgproperty(property):
-    """Caching property decorator with auto setting and None reset
+###########################
+# Supplements to ccddata  #
+###########################
+def keyword_arithmetic(meta, operand1, operation, operand2,
+                       keylist=None, handle_image=None):
+    """Apply arithmetic to FITS keywords
 
-    . myprop = None resets system and forces the getter to run
+    meta : ordered_dict
 
-    . when getter runs and returns a non-None value, that value is
-    cached and returned instead of running the getter
+        FITS header of operand1 *after* processing by other arithmetic
+        operations.  Sensible use of this feature requires
+        ``handle_meta`` to be set to 'first_found' or callable that
+        returns a FITS header  
 
-    . myprop = 'some_value' overrides the getter -- 'some_value' is
-    cached and returned on subsequent queries of myprop
+    operand1 : `NDData`-like instance
+        Generally the self of the calling object
 
-    . No setter is required to set the property, but if one is
-    provided, its return value is used as the cached value that
-    overrides the getter (i.e., not knowledge of the internal workings
-    of the system is requried to make it work)
+    operation : callable
+            The operation that is performed on the `NDData`. Supported are
+            `numpy.add`, `numpy.subtract`, `numpy.multiply` and
+            `numpy.true_divide`.
 
-    . Deleters can be specified to do something before the cache
-    reference is deleted.  Deletion is not permanent -- the next time
-    myprop is queried, the getter is run
+    operand2 : `NDData`-like instance
+        Generally the self of the calling object
 
-    . shape_check class variable: None, 0, or tuple
+    keylist : list
 
-        This class variable affects the treatment of the value
-        returned by the setter or if no setter is
-        present, value provided by user.  
-        . None: the value is cached without modification
-        . 0: value is converted to a numpy array with np.asarray()
-        . tuple: shape of resulting np.array must match shape_check or
-        a ValueError is raised
+        List of FITS keywords to apply ``operation`` to.  Each keyword
+        value stands in the place of ``operand1`` and a new keyword
+        value is calculated using the ``operation`` and ``operand2.``
+        If ``operand2`` is an image, ``handle_image`` will be called
+        to convert it to a scalar or ``None`` (see ``handle_image``)
 
-    Inspired by `astropy.utils.lazyproperty` and `property_manager
-    <https://github.com/xolox/python-property-manager>`
+    handle_image : callable
 
-    .NOTE: This cache operates on the top-level property.  In a
-    complicated multi-inheritance system with inter-connected property
-    like `pgdata`, some time savings in calculation of quantities
-    could be achieved by caching property at each inheritance level
-    individually, say by making the `key` a MRO level-unique string,
-    e.g. property name, `self.__class__.__name__` and module name.
-    Then a None reset would only reset the levels from the top down to
-    the MRO at which the property was set to None.  This guarantees
-    the children get a freshly calculated value of the affected
-    properties and acknowledges that the parents don't care that the
-    change was made, since they never depended on the relationship
-    between the property in the first place.  Or if they did, they
-    should be super()ed into the calculation and the most senior
-    setter concerned about the interrelationship would also be calling
-    for the reset of the affected other property.  The side-affect of
-    caching all of the intermediate results would be more memory use,
-    since all of the intermediate property would have long-lived
-    references.  For the pgdata coordiate-oriented stuff, this is not
-    a big deal, but it is not generally appropriate.
+        Called with arguments of keyword_arithmetic (minus
+        ``handle_image``) when ``operand2`` is an image.  Return value
+        of ``None`` signifies application of ``operation`` would
+        nullify keywords in ``keylist,`` which are then removed.  If
+        transformation of ``operand2`` into a scalar is possible
 
     """
-    
-    shape_check = None
-    def __init__(self, fget,
-                 fset=None,
-                 fdel=None,
-                 doc=None):
-        super().__init__(fget, fset, fdel, doc)
-        self._key = self.fget.__name__
-        self._none_proxy = 'None proxy'
+    if meta is None or keylist is None:
+        return meta
+    # Get a list of non-None values for our keylist
+    kvlist = [kv for kv in [(k, meta.get(k)) for k in keylist]
+             if kv[1] is not None]
+    if kvlist is None:
+        return meta
+    npshapeo2 = np.asarray(operand2.shape)
+    dimso2 = npshapeo2.sum()
+    if dimso2 == 0:
+        # Scalar
+        o2 = operand2.data
+    else:
+        if handle_image is None:
+            o2 = None
+        else:
+            o2 = handle_image(meta, operand1, operation, operand2,
+                              keylist=keylist)
+    for k, v in kvlist:
+        if o2 is None:
+            del meta[k]
+            log.debug('Cannot express operand2 as single number, deleting ' + k)
+        else:
+            kcomment = meta.comments[k]
+            # Strip off old units, assuming they are separated by space
+            kcomment, _ = kcomment.rsplit(maxsplit=1)
+            v = operation(v * operand1.unit,
+                          o2 * operand2.unit)
+            kcomment = f'{kcomment} ({v.unit.to_string()})'
+            meta[k] = (v.value, kcomment)
+    return meta        
 
-    def npval(self, val):
-        """Turn val into np.array if shape_check is non-None.  Checks
-        shape of resulting array if shape_check is a tuple"""
-        if self.shape_check is None:
-            return val
-        val = np.asarray(val)
-        if (self.shape_check != 0
-            and val.shape != self.shape_check):
-            raise ValueError(f'value "{val}" is not a sensible {self.shape_check}-dimensional coordinate')
-        return val
+class KeywordArithmeticMixin(NDArithmeticMixin):
+    """Mixin that adds FITS keyword arithmetic capability to `NDArithmeticMixin`
 
-    def __get__(self, obj, owner=None):
-        try:
-            obj_dict = obj.__dict__
-            val = obj_dict.get(self._key, _NotFound)
-            if val is self._none_proxy:
-                return None
-            if val is _NotFound or val is None:
-                val = self.fget(obj)
-                if val is None:
-                    obj_dict[self._key] = self._none_proxy
-                    return None
-                val = self.npval(val)
-                obj_dict[self._key] = val
-            return val
-        except AttributeError:
-            if obj is None:
-                return self
-            raise
-
-    def __set__(self, obj, val):
-        obj_dict = obj.__dict__
-        if self.fset:
-            val = self.fset(obj, val)
-        if val is not None:
-            val = self.npval(val)
-        obj_dict[self._key] = val
-
-    def __delete__(self, obj):
-        if self.fdel:
-            self.fdel(obj)
-        obj.__dict__.pop(self._key, None)    # Delete if present
-
-
-class pgcoordproperty(pgproperty):
-    shape_check=(2,)
-
-#######################
-# Useful utilities    #
-#######################
-def hist_of_im(im, binsize=1, show=False):
-    """Returns a tuple of the histogram of image and index into *centers* of
-bins."""
-    # Code from west_aux.py, maskgen.
-    # Histogram bin size should be related to readnoise
-    hrange = (im.data.min(), im.data.max())
-    nbins = int((hrange[1] - hrange[0]) / binsize)
-    hist, edges = np.histogram(im, bins=nbins,
-                               range=hrange, density=False)
-    # Convert edges of histogram bins to centers
-    centers = (edges[0:-1] + edges[1:])/2
-    if show:
-        plt.plot(centers, hist)
-        plt.show()
-        plt.close()
-    return (hist, centers)
-
-def iter_linfit(x, y, max_resid=None):
-    """Performs least squares linear fit iteratively to discard bad points
-
-    If you actually know the statistical weights on the points,
-    just use polyfit directly.
+    As with the `NDArithmeticMixin`, add this
 
     """
-    # Let polyfit report errors in x and y
-    coefs = np.polyfit(x, y, 1)
-    # We are done if we have just two points
-    if len(x) == 2:
-        return coefs
-        
-    # Our first fit may be significantly pulled off by bad
-    # point(s), particularly if the number of points is small.
-    # Construct a repeat until loop the Python way with
-    # while... break to iterate to squeeze bad points out with
-    # low weights
-    last_redchi2 = None
-    iterations = 1
-    while True:
-        # Calculate weights roughly based on chi**2, but not going
-        # to infinity
-        yfit = x * coefs[0] + coefs[1]
-        resid = (y - yfit)
-        if resid.all == 0:
-            break
-        # Add 1 to avoid divide by zero error
-        resid2 = resid**2 + 1
-        # Use the residual as the variance + do the algebra
-        redchi2 = np.sum(1/(resid2))
-        coefs = np.polyfit(x, y, 1, w=1/resid2)
-        # Converge to a reasonable epsilon
-        if last_redchi2 and last_redchi2 - redchi2 < np.finfo(float).eps*10:
-            break
-        last_redchi2 = redchi2
-        iterations += 1
 
-    # The next level of cleanliness is to exclude any points above
-    # max_resid from the fit (if specified)
-    if max_resid is not None:
-        goodc = np.where(np.abs(resid) < max_resid)
-        # Where returns a tuple of arrays!
-        if len(goodc[0]) >= 2:
-            coefs = iter_linfit(x[goodc], y[goodc])
-    return coefs
-    
+    arithmetic_keylist = None
+    handle_image = None
+
+    def _arithmetic(self, operation, operand, **kwds):
+        result, kwargs = super()._arithmetic(operation, operand, **kwds)
+
+        meta = kwargs['meta']
+        newmeta = keyword_arithmetic(meta, self, operation, operand,
+                                     keylist=self.arithmetic_keylist,
+                                     handle_image=self.handle_image)
+        kwargs['meta'] = newmeta
+        return result, kwargs
+
+#######################
+# Primary Objects     #
+#######################
+
 def quality_checker(value):
     if value is None:
         value = 0
@@ -210,9 +126,6 @@ def quality_checker(value):
     else:
         return value
 
-#######################
-# Primary Objects     #
-#######################
 class PGCenter():
     """Base class for containing object center and desired center
 
@@ -268,110 +181,42 @@ class PGCenter():
     def tmid(self):
         pass
 
+# We want to use astropy's CCDData to store our 
+
+
 # Pretty much all CCD-like detectors present their raw data in adu.
 # In the event this needed to change for a particular system, insert a
-# subclass redefining raw_unit anywhere on the CameraData/PGData
-# inheritance chain.  That raw_unit will override this one.  Note,
-# doing this as a class variable is necessary because of the CCDData
-# read classmethod
+# subclass redefining raw_unit anywhere on the PGData inheritance
+# chain.  That raw_unit will override this one.  Note, doing this as a
+# class variable is necessary because of the CCDData read classmethod
 class ADU():
-    raw_unit = u.adu
+    """Simple class to define the class variable `fallback_unit` =
+    `~astropy.units.adu` for classes using the
+    :class:`ccdmultipipe.FbuCCDData` system
 
+    """
+    fallback_unit = u.adu
 
-# Although CameraData is intended to be for containing just camera
-# information, make it a subclass of FbuCCDData so that the raw_unit
-# can be properly inserted when CCD images are read in.
-
-# I envision either the camera file being use with a camera name and
-# method to initialize all of the propriety, or just a new class being
-# prepared that has the property hand-coded as class variables
-class CameraData(FbuCCDData):
-    raw_unit = u.adu
-    camera_data_file = None # some kind of file that would contain this info
-    camera_name = None
-    camera_description = None
-    full_naxis1 = None
-    full_naxis2 = None
-    satlevel = None
-    nonlinlevel = None
-    gain = None
-    readnoise = None
-
-    def __init__(self,
-                 *args,
-                 camera_data_file=None,
-                 camera_name=None,
-                 camera_description=None,
-                 raw_unit=None, # This will not affect the read classmethod
-                 full_naxis1=None,
-                 full_naxis2=None,
-                 satlevel=None,
-                 nonlinlevel=None,
-                 gain=None,
-                 readnoise=None,
-                 **kwargs):
-        self.camera_data_file = camera_data_file or self.camera_data_file
-        self.camera_name = camera_name or self.camera_name
-        self.camera_description = camera_description or self.camera_description
-        self.raw_unit = raw_unit or self.raw_unit
-        self.full_naxis1 = full_naxis1 or self.full_naxis1
-        self.full_naxis2 = full_naxis2 or self.full_naxis2
-        self.satlevel = satlevel or self.satlevel
-        self.nonlinlevel = nonlinlevel or self.nonlinlevel
-        self.gain = gain or self.gain
-        self.readnoise = readnoise or self.readnoise
-        super().__init__(*args, fallback_unit=self.raw_unit, **kwargs)
-
-    @classmethod
-    def read(cls, filename, 
-             raw_unit=None,
-             **kwargs):
-        """Use ``raw_unit`` instead of ``fallback_unit``."""
-        raw_unit = raw_unit or cls.raw_unit
-        return super(CameraData, cls).read(filename,
-                                       fallback_unit=raw_unit,
-                                       **kwargs)
-
-    def _card_write(self):
-        """Write FITS header cards for camera
-
-        """
-        self.meta['GAIN'] = (self.gain, f'CCD charge gain '
-                             '{self.gain.unit.to_str()}')
-        self.meta['SATLEVEL'] = (self.satlevel, f'CCD saturation level '
-                                 '{self.satlevel.unit.to_str()}')
-        self.meta['NONLIN'] = (self.nonlinlevel, f'CCD nonlinearity '
-                               'level {self.nonlinlevel.unit.to_str()}')
-        self.meta['RDNOISE'] = (self.readnoise, f'CCD readnoise '
-                               'level {self.readnoise.unit.to_str()}')
-
-class SX694(CameraData):
-    camera_name = 'SX694'
-    camera_description = 'Starlight Xpress Trius SX694 mono, 2017 model version'
-    raw_unit = u.adu
-    # naxis1 = fastest changing axis in FITS primary image = X in
-    # Cartesian thought
-    # naxis1 = next to fastest changing axis in FITS primary image = Y in
-    # Cartesian thought
-    full_naxis1 = 2750*u.pix
-    full_naxis2 = 2200*u.pix
-    # 16-bit A/D converter
-    satlevel = (2**16-1)*raw_unit
-    nonlinlevel = (42000 - 1811)*raw_unit
-    # Gain measured in /data/io/IoIO/observing/Exposure_Time_Calcs.xlsx.
-    # Value agrees well with Trius SX-694 advertised value (note, newer
-    # "PRO" model has a different gain value).  Stored in GAIN keyword
-    gain = 0.3 * u.electron/raw_unit
-    # Sample readnoise measured as per ioio.notebk
-    # Tue Jul 10 12:13:33 2018 MCT jpmorgen@byted 
-    # Readnoies is measured regularly as part of master bias creation and
-    # stored in the RDNOISE keyword.  This is used as a sanity check.
-    readnoise = 15.475665*raw_unit
-
-class PGData(CameraData):
+class PGData(ADU, FbuCCDData):
     """Base class for image data in the `precisionguide` system
 
-    This class stores CCD data using `~astropy.nddata.CCDData` as a
+    This class stores CCD data and defines methods and property to
+    calculate/store four primary quantities: :prop:`obj_center`,
+    :prop:`desired_center`, :prop:`quality`, and :prop:`tmid`, as
+    described in the documentation.
+
+    CCD data are stored using `astropy.nddata.CCDData` as its base
+    class with the addition of a class,
+    :class:`ccdmultipipe.FbuCCDData`, that ensures the
+    `~astropy.nddata.CCDData` will always be defined with a
+    :class:`astropy.units.Unit`.  Since all or nearly all CCD-like
+    detectors present their raw data in `~astropy.units.adu`, this is
+    the default :class:`~astropy.units.Unit` assumed by
+    :class:`PGData`.  In the event this needs to change for a
+    particular system, a class similar to :class:`ADU` (e.g. "Count")
+    could be defined and inserted into the inheritance chain
+
+
     superclass and adds properties and methods that calculate/store
     four quantities: :prop:`obj_center`, :prop:`desired_center`,
     :prop:`quality`, and :prop:`tmid`.  These four quantities are
@@ -413,9 +258,14 @@ class PGData(CameraData):
 
     @pgcoordproperty
     def obj_center(self):
-        """Center of object, (Y, X).  Quality of center determination must be
-    set as well.  Base class uses out-of-bounds value (-99, -99) for
-    center and 0 for quality
+        """Center of object, (Y, X) in pixel
+
+        Coordinates are referenced to the image stored in the
+    :prop:`data` property.  This image may be a binned subframe of
+    full detector.  Use :meth:`unbinned(self.obj_center)` to obtain
+    the coordinates in raw detector pixels.  Quality of center
+    determination must be set as well.  Base class uses out-of-bounds
+    value (-99, -99) for center and 0 for quality
 
         Results are stored using the :class:`pgcoordproperty`
         decorator system.  See documentation of that class for
@@ -429,7 +279,8 @@ class PGData(CameraData):
     @pgcoordproperty
     def desired_center(self):
         """Desired center of object (Y, X).  Base class uses center of
-    data array.
+    data array.  As with :prop:`obj_center`, :prop:`desired_center` is
+    referenced to the data stored in :prop:`data`
 
         Results are stored using the :class:`pgcoordproperty`
         decorator system.  See documentation of that class for
@@ -444,8 +295,11 @@ class PGData(CameraData):
 
     @pgproperty
     def quality(self):
-        """Quality of center determination.  Quality should always be
-    set in the obj_center setter"""
+        """Quality of center determination on a 0 to 10 integer scale.
+
+  Quality should always be set in the :prop:`obj_center` setter
+
+        """
         self.obj_center
 
     @quality.setter
@@ -458,6 +312,7 @@ class PGData(CameraData):
     @pgproperty
     def tmid(self):
         """`~astropy.time.Time` at midpoint of observation"""
+        
         tmid_str = self.meta.get('tmid')
         if tmid_str is not None:
             return Time(tmid_str, format='fits')
@@ -562,11 +417,12 @@ class PGData(CameraData):
             return self
         # If we made it here, we need to unbin
         self_unbinned = self.copy()
-        self_unbinned.data = im_unbinned(self.data)
-        self_unbinned.mask = im_unbinned(self.mask)
-        self_unbinned.uncertainty = im_unbinned(self.uncertainty)
+        self_unbinned.data = self.im_unbinned(self.data)
+        self_unbinned.mask = self.im_unbinned(self.mask)
+        self_unbinned.uncertainty = self.im_unbinned(self.uncertainty)
         self_unbinned.binning = np.asarray((1,1))
         self_unbinned.subframe_origin = np.asarray((0,0))
+        # --> NOTE we are not messing with any other metadata
         return self_unbinned
 
     @property
@@ -606,7 +462,6 @@ class PGData(CameraData):
                              ('TMID', self.tmid.value,
                               'midpoint of exposure, UT'),
                              after=True)
-        super()._card_write()
 
     def write(self, *args, **kwargs):
         self._card_write()
@@ -715,9 +570,109 @@ class FITSReaderPGD(PGData):
     @quality.setter
     def quality(self, value):
         """Unset quality translates to 0 quality"""
-        if value:
+        if value is not None:
             value = quality_checker(value)
         return value
+
+#### In the end, I think CameraData is a bad idea, since this can all
+#### go into and out of metadata.  Unit in principle could go there
+#### too (e.g. BUNIT), however it is implemented as separate property
+#### in the underlying CCDData/NDData.  No need to add that level of
+#### complexity to these.  FITS card metadata property with comments
+#### is good enough.
+###
+#### Although CameraData is intended to be for containing just camera
+#### information, make it a subclass of FbuCCDData so that the raw_unit
+#### can be properly inserted when CCD images are read in.
+###
+#### I envision either the camera file being use with a camera name and
+#### method to initialize all of the propriety, or just a new class being
+#### prepared that has the property hand-coded as class variables
+###class CameraData(FbuCCDData):
+###    raw_unit = u.adu
+###    camera_data_file = None # some kind of file that would contain this info
+###    camera_name = None
+###    camera_description = None
+###    full_naxis1 = None
+###    full_naxis2 = None
+###    satlevel = None
+###    nonlinlevel = None
+###    gain = None
+###    readnoise = None
+###
+###    def __init__(self,
+###                 *args,
+###                 camera_data_file=None,
+###                 camera_name=None,
+###                 camera_description=None,
+###                 raw_unit=None, # This will not affect the read classmethod
+###                 full_naxis1=None,
+###                 full_naxis2=None,
+###                 satlevel=None,
+###                 nonlinlevel=None,
+###                 gain=None,
+###                 readnoise=None,
+###                 **kwargs):
+###        self.camera_data_file = camera_data_file or self.camera_data_file
+###        self.camera_name = camera_name or self.camera_name
+###        self.camera_description = camera_description or self.camera_description
+###        self.raw_unit = raw_unit or self.raw_unit
+###        self.full_naxis1 = full_naxis1 or self.full_naxis1
+###        self.full_naxis2 = full_naxis2 or self.full_naxis2
+###        self.satlevel = satlevel or self.satlevel
+###        self.nonlinlevel = nonlinlevel or self.nonlinlevel
+###        self.gain = gain or self.gain
+###        self.readnoise = readnoise or self.readnoise
+###        super().__init__(*args, fallback_unit=self.raw_unit, **kwargs)
+###
+###    @classmethod
+###    def read(cls, filename, 
+###             raw_unit=None,
+###             **kwargs):
+###        """Use ``raw_unit`` instead of ``fallback_unit``."""
+###        raw_unit = raw_unit or cls.raw_unit
+###        return super(CameraData, cls).read(filename,
+###                                       fallback_unit=raw_unit,
+###                                       **kwargs)
+###
+###    def _card_write(self):
+###        """Write FITS header cards for camera
+###
+###        """
+###        self.meta['GAIN'] = (self.gain, f'CCD charge gain '
+###                             '{self.gain.unit.to_str()}')
+###        self.meta['SATLEVEL'] = (self.satlevel, f'CCD saturation level '
+###                                 '{self.satlevel.unit.to_str()}')
+###        self.meta['NONLIN'] = (self.nonlinlevel, f'CCD nonlinearity '
+###                               'level {self.nonlinlevel.unit.to_str()}')
+###        self.meta['RDNOISE'] = (self.readnoise, f'CCD readnoise '
+###                               'level {self.readnoise.unit.to_str()}')
+###
+###class SX694(CameraData):
+###    camera_name = 'SX694'
+###    camera_description = 'Starlight Xpress Trius SX694 mono, 2017 model version'
+###    raw_unit = u.adu
+###    # naxis1 = fastest changing axis in FITS primary image = X in
+###    # Cartesian thought
+###    # naxis1 = next to fastest changing axis in FITS primary image = Y in
+###    # Cartesian thought
+###    full_naxis1 = 2750*u.pix
+###    full_naxis2 = 2200*u.pix
+###    # 16-bit A/D converter
+###    satlevel = (2**16-1)*raw_unit
+###    nonlinlevel = (42000 - 1811)*raw_unit
+###    # Gain measured in /data/io/IoIO/observing/Exposure_Time_Calcs.xlsx.
+###    # Value agrees well with Trius SX-694 advertised value (note, newer
+###    # "PRO" model has a different gain value).  Stored in GAIN keyword
+###    gain = 0.3 * u.electron/raw_unit
+###    # Sample readnoise measured as per ioio.notebk
+###    # Tue Jul 10 12:13:33 2018 MCT jpmorgen@byted 
+###    # Readnoies is measured regularly as part of master bias creation and
+###    # stored in the RDNOISE keyword.  This is used as a sanity check.
+###    readnoise = 15.475665*raw_unit
+
+
+
 
 class Ex(PGData):
     @pgcoordproperty
@@ -955,8 +910,8 @@ if __name__ == "__main__":
     #pgd.obj_center = None
     #print(pgd.obj_center, pgd.desired_center)
     #
-    pgd = CenteredPGD.read(fname)
-    print(pgd.obj_center, pgd.desired_center)
+    #pgd = CenteredPGD.read(fname)
+    #print(pgd.obj_center, pgd.desired_center)
     
     #pgd = MyPGD.read(fname)
     #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
@@ -981,17 +936,17 @@ if __name__ == "__main__":
     #pgd.write('/tmp/testfits.fits', overwrite=True)
 
     #class MyPGD(OffsetPGD, CenteredPGD, PGData):
-    class MyPGD(OffsetPGD, CenteredPGD, MaxImPGD, SX694):
+    class MyPGD(OffsetPGD, CenteredPGD, MaxImPGD):#, SX694):
         pass
     #pgd = MyPGD.read(fname)
     #pgd.center_offset += (10, -30)
     #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
     #pgd.write('/tmp/testfits.fits', overwrite=True)
 
-    pgd = MyPGD(pgd)
-    print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
-    pgd = MyPGD(pgd.data)
-    print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd = MyPGD(pgd)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
+    #pgd = MyPGD(pgd.data)
+    #print(pgd.obj_center, pgd.desired_center, pgd.center_offset)
 
     #pgd = Ex.read(fname)
     #print(pgd.obj_center, pgd.desired_center)
@@ -1005,12 +960,12 @@ if __name__ == "__main__":
     #pgd = ExampleFITSReaderPGD.read(fname)
     #print(pgd.obj_center, pgd.desired_center, pgd.quality)    
 
-    pgd = CenterOfMassPGD.read(fname)
-    print(pgd.obj_center, pgd.desired_center, pgd.quality)        
-
-    off_filt = '/data/io/IoIO/raw/2018-01-28/R-band_off_ND_filter.fit'
-    pgd = CenterOfMassPGD.read(off_filt) 
-    print(pgd.obj_center, pgd.desired_center, pgd.quality)        
+    #pgd = CenterOfMassPGD.read(fname)
+    #print(pgd.obj_center, pgd.desired_center, pgd.quality)        
+    #
+    #off_filt = '/data/io/IoIO/raw/2018-01-28/R-band_off_ND_filter.fit'
+    #pgd = CenterOfMassPGD.read(off_filt) 
+    #print(pgd.obj_center, pgd.desired_center, pgd.quality)        
 
     #pgd.obj_center = (1,1)
     #pgd.desired_center = (1,1)
