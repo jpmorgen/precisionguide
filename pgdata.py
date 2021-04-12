@@ -9,14 +9,16 @@ code.
 """
 import numpy as np
 
+from scipy.signal import convolve2d
+from scipy.ndimage.measurements import center_of_mass
+
 from astropy import log
 from astropy.io import fits
 from astropy import units as u
 from astropy.time import Time
 from astropy.nddata import NDArithmeticMixin
-#from astropy.convolution import Gaussian2DKernel
 
-from ccdmultipipe import FbuCCDData
+from ccdmultipipe.utils import FbuCCDData
 
 _NotFound = object()
 
@@ -237,8 +239,7 @@ def quality_checker(value):
         value = 0
     if not isinstance(value, int) or value < 0 or value > 10:
         raise ValueError('quality must be an integer value from 0 to 10')
-    else:
-        return value
+    return value
 
 class PGCenter():
     """Base class for containing object center and desired center
@@ -257,7 +258,7 @@ class PGCenter():
 
     quality : int
         0 -- 10 ranking of quality of quality of ``obj_center``
-        determination, with 0 = very bad, 10 = very good
+        determination, with 1 = very bad, 10 = very good, 0 = invalid
 
     tmid : `~astropy.time.Time`
         Time at midpoint of observation
@@ -368,7 +369,7 @@ class PGData(ADU, FbuCCDData):
 
         self._invalid_obj_center = (-99, -99)
         self._invalid_desired_center = (-99, -99)
-        self._invalid_quality = False#-1
+        self._invalid_quality = 0
 
     @pgcoordproperty
     def obj_center(self):
@@ -419,9 +420,7 @@ class PGData(ADU, FbuCCDData):
     @quality.setter
     def quality(self, value):
         """Unset quality translates to 0 quality"""
-        # check for self._invalid_quality
-        if value:
-            return quality_checker(value)
+        return quality_checker(value)
 
     @pgproperty
     def tmid(self):
@@ -1160,6 +1159,6 @@ if __name__ == "__main__":
     #
     #ccd = FbuCCDData.read(fname1, unit='electron')
 
-    #fname1 = '/data/Mercury/raw/2020-05-27/Mercury-0005_Na-on.fit'
-    #pgd = CenterOfMassPGD.read(fname1)
-    #print(pgd.obj_center, pgd.desired_center)
+    fname1 = '/data/Mercury/raw/2020-05-27/Mercury-0005_Na-on.fit'
+    pgd = CenterOfMassPGD.read(fname1)
+    print(pgd.obj_center, pgd.desired_center)

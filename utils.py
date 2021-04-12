@@ -2,13 +2,6 @@
 
 import numpy as np
 
-from scipy.signal import convolve2d
-from scipy.ndimage.measurements import center_of_mass
-
-
-#######################
-# Useful utilities    #
-#######################
 def hist_of_im(im, binsize=1, show=False):
     """Returns a tuple of the histogram of image and index into *centers* of
 bins."""
