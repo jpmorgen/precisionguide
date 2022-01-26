@@ -16,9 +16,8 @@ from astropy import log
 from astropy.io import fits
 from astropy import units as u
 from astropy.time import Time
-from astropy.nddata import NDArithmeticMixin
 
-from ccdmultipipe.utils import FbuCCDData
+from ccdmultipipe.utils.ccddata import FbuCCDData
 
 _NotFound = object()
 
@@ -136,100 +135,6 @@ class pgproperty(property):
 class pgcoordproperty(pgproperty):
     shape_check=(2,)
 
-###########################
-# Supplements to ccddata  #
-###########################
-def keyword_arithmetic(meta, operand1, operation, operand2,
-                       keylist=None, handle_image=None):
-    """Apply arithmetic to FITS keywords
-
-    meta : ordered_dict
-
-        FITS header of operand1 *after* processing by other arithmetic
-        operations.  Sensible use of this feature requires
-        ``handle_meta`` to be set to 'first_found' or callable that
-        returns a FITS header  
-
-    operand1 : `NDData`-like instance
-        Generally the self of the calling object
-
-    operation : callable
-            The operation that is performed on the `NDData`. Supported are
-            `numpy.add`, `numpy.subtract`, `numpy.multiply` and
-            `numpy.true_divide`.
-
-    operand2 : `NDData`-like instance
-        Generally the self of the calling object
-
-    keylist : list
-
-        List of FITS keywords to apply ``operation`` to.  Each keyword
-        value stands in the place of ``operand1`` and a new keyword
-        value is calculated using the ``operation`` and ``operand2.``
-        If ``operand2`` is an image, ``handle_image`` will be called
-        to convert it to a scalar or ``None`` (see ``handle_image``)
-
-    handle_image : callable
-
-        Called with arguments of keyword_arithmetic (minus
-        ``handle_image``) when ``operand2`` is an image.  Return value
-        of ``None`` signifies application of ``operation`` would
-        nullify keywords in ``keylist,`` which are then removed.  If
-        transformation of ``operand2`` into a scalar is possible
-
-    """
-    if meta is None or keylist is None:
-        return meta
-    # Get a list of non-None values for our keylist
-    kvlist = [kv for kv in [(k, meta.get(k)) for k in keylist]
-             if kv[1] is not None]
-    if kvlist is None:
-        return meta
-    npshapeo2 = np.asarray(operand2.shape)
-    dimso2 = npshapeo2.sum()
-    if dimso2 == 0:
-        # Scalar
-        o2 = operand2.data
-    else:
-        if handle_image is None:
-            o2 = None
-        else:
-            o2 = handle_image(meta, operand1, operation, operand2,
-                              keylist=keylist)
-    for k, v in kvlist:
-        if o2 is None:
-            del meta[k]
-            log.debug('Cannot express operand2 as single number, deleting ' + k)
-        else:
-            kcomment = meta.comments[k]
-            # Strip off old units, assuming they are separated by space
-            kcomment, _ = kcomment.rsplit(maxsplit=1)
-            v = operation(v * operand1.unit,
-                          o2 * operand2.unit)
-            kcomment = f'{kcomment} ({v.unit.to_string()})'
-            meta[k] = (v.value, kcomment)
-    return meta        
-
-class KeywordArithmeticMixin(NDArithmeticMixin):
-    """Mixin that adds FITS keyword arithmetic capability to `NDArithmeticMixin`
-
-    As with the `NDArithmeticMixin`, add this
-
-    """
-
-    arithmetic_keylist = None
-    handle_image = None
-
-    def _arithmetic(self, operation, operand, **kwds):
-        result, kwargs = super()._arithmetic(operation, operand, **kwds)
-
-        meta = kwargs['meta']
-        newmeta = keyword_arithmetic(meta, self, operation, operand,
-                                     keylist=self.arithmetic_keylist,
-                                     handle_image=self.handle_image)
-        kwargs['meta'] = newmeta
-        return result, kwargs
-
 #######################
 # Primary Objects     #
 #######################
@@ -260,19 +165,24 @@ class PGCenter():
         0 -- 10 ranking of quality of quality of ``obj_center``
         determination, with 1 = very bad, 10 = very good, 0 = invalid
 
-    tmid : `~astropy.time.Time`
-        Time at midpoint of observation
+    tavg : `~astropy.time.Time`
+        Average time of observation.  For simple exposures, this is
+        the midpoint.  For exposures integrated from several segments
+        one might imagine this would be the average of the exposure
+        efficiency as a function of time.  Hoever Rots et al (A&A 574,
+        A36 2015) note no standard is defined.  This turns into the
+        DATE-AVG FITS keyword
 
     """
     def __init__(self,
                  obj_center=None,
                  desired_center=None,
                  quality=None,
-                 tmid=None):
+                 tavg=None):
         self.obj_center = obj_center
         self.desired_center = desired_center
         self.quality = quality
-        self.tmid = tmid
+        self.tavg = tavg
 
     # Our decorator does everything we need :-)
     @pgcoordproperty
@@ -292,8 +202,8 @@ class PGCenter():
         """Unset quality translates to 0 quality"""
         return quality_checker(value)
     
-    @pgcoordproperty
-    def tmid(self):
+    @pgproperty
+    def tavg(self):
         pass
 
 # We want to use astropy's CCDData to store our 
@@ -317,7 +227,7 @@ class PGData(ADU, FbuCCDData):
 
     This class stores CCD data and defines methods and property to
     calculate/store four primary quantities: :prop:`obj_center`,
-    :prop:`desired_center`, :prop:`quality`, and :prop:`tmid`, as
+    :prop:`desired_center`, :prop:`quality`, and :prop:`tavg`, as
     described in the documentation.
 
     CCD data are stored using `astropy.nddata.CCDData` as its base
@@ -334,7 +244,7 @@ class PGData(ADU, FbuCCDData):
 
     superclass and adds properties and methods that calculate/store
     four quantities: :prop:`obj_center`, :prop:`desired_center`,
-    :prop:`quality`, and :prop:`tmid`.  These four quantities are
+    :prop:`quality`, and :prop:`tavg`.  These four quantities are
     intended to be returned in a :class:`PGCenter` object for
     subsequent lightweight storage and use in the precisionguide
     system.  Because precisionguide controls the absolute position of
@@ -423,16 +333,15 @@ class PGData(ADU, FbuCCDData):
         return quality_checker(value)
 
     @pgproperty
-    def tmid(self):
-        """`~astropy.time.Time` at midpoint of observation"""
+    def tavg(self):
+        """`~astropy.time.Time` Average time of observation,  See
+        :param:`tavg` of :class:`PGCenter.`""" 
         
-        tmid_str = self.meta.get('tmid')
-        if tmid_str is not None:
-            return Time(tmid_str, format='fits')
+        tavg_str = self.meta.get('date-avg')
+        if tavg_str is not None:
+            return Time(tavg_str, format='fits')
         try:
-            exptime = self.meta.get(self.darktime_key.lower()) 
-            if exptime is None:
-                exptime = self.meta[self.exptime_key.lower()]
+            exptime = self.meta[self.exptime_key.lower()]
             exptime *= u.s
             dateobs_str = self.meta[self.date_obs_key.lower()] 
             return Time(dateobs_str, format='fits') + exptime/2
@@ -440,13 +349,13 @@ class PGData(ADU, FbuCCDData):
             log.error(f'Cannot read sufficient combination of '
                       '{self.date_obs_key}, {self.darktime_key} '
                       'and/or {self.exptime_key} keywords from FITS '
-                      'header to establish tmid')
+                      'header to establish tavg')
             return None
 
-    @tmid.setter
-    def tmid(self, val):
+    @tavg.setter
+    def tavg(self, val):
         if not isinstance(val, Time):
-            raise ValueError('tmid must be of type `~astropy.time.Time`')
+            raise ValueError('tavg must be of type `~astropy.time.Time`')
 
     @pgcoordproperty
     def binning(self):
@@ -489,7 +398,8 @@ class PGData(ADU, FbuCCDData):
         return (coords - self.subframe_origin) / self.binning
         
     def im_unbinned(self, a):
-        """Returns an unbinned version of a.  a must be same shape as data
+        """Returns an unbinned version of a.  a must be same shape as self.data
+        NOTE: to preserve flux, divide by (np.prod(self.binning)
         """
         if a is None:
             return None
@@ -552,7 +462,7 @@ class PGData(ADU, FbuCCDData):
         return PGCenter(self.unbinned(self.obj_center),
                         self.unbinned(self.desired_center),
                         self.quality,
-                        self.tmid)
+                        self.tavg)
 
     def _card_write(self):
         """Writes FITS header cards for obj and desired center coordinates in
@@ -560,6 +470,10 @@ class PGData(ADU, FbuCCDData):
         image analysis software showing the image)
 
         """
+        if not np.all(np.isfinite(self.obj_center)):
+            self.obj_center = self._invalid_obj_center
+            log.warning(f'non-finite obj_center found, converting to '
+                        f'{self.obj_center}')
         # Note pythonic y, x coordinate ordering
         self.meta['OBJ_CR0'] = (self.obj_center[1], 'Calculated object '
                                 'center X')
@@ -570,9 +484,10 @@ class PGData(ADU, FbuCCDData):
         self.meta['HIERARCH CENTER_QUALITY'] = (self.quality,
                                                 'Quality on 0-10 scale '
                                                 'of center determination')
-        if not self.meta.get('TMID'):
+        # As per https://www.aanda.org/articles/aa/pdf/2015/02/aa24653-14.pdf
+        if not self.meta.get('DATE-AVG'):
             self.meta.insert('DATE-OBS',
-                             ('TMID', self.tmid.value,
+                             ('DATE-AVG', self.tavg.value,
                               'midpoint of exposure, UT'),
                              after=True)
 
@@ -604,11 +519,11 @@ class FITSReaderPGD(PGData):
     #        dx = self.meta['DES_CR0']
     #        dy = self.meta['DES_CR1']
     #        q = self.meta['CENTER_QUALITY']
-    #        tmid_str = self.meta['TMID']
+    #        tavg_str = self.meta['DATE-AVG']
     #        self.obj_center = (cy, cx)
     #        self.desired_center = (dy, dx)
     #        self.quality = q
-    #        self.tmid = Time(tmid_str, format='fits')
+    #        self.tavg = Time(tavg_str, format='fits')
     #        log.info('Center info set from FITS header, use '
     #                 'recalculate=True to avoid')
     #    except Exception as e:
@@ -970,6 +885,7 @@ class MaxImPGD(PGData):
         """Image binning in Y,X order"""
         binning = (self.meta['YBINNING'],
                    self.meta['XBINNING'])
+        binning = np.asarray(binning)
         return binning
         
     @pgcoordproperty
@@ -1162,3 +1078,7 @@ if __name__ == "__main__":
     fname1 = '/data/Mercury/raw/2020-05-27/Mercury-0005_Na-on.fit'
     pgd = CenterOfMassPGD.read(fname1)
     print(pgd.obj_center, pgd.desired_center)
+
+#fname1 = '/data/io/IoIO/raw/20210310/HD 132052-S001-R001-C002-R.fts'
+#pgd = MaxImPGD.read(fname1)
+#print(pgd.meta)

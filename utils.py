@@ -1,5 +1,6 @@
 """Utilities for precisionguide system"""
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 def hist_of_im(im, binsize=1, show=False):
