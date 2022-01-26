@@ -264,6 +264,8 @@ class PGData(ADU, FbuCCDData):
                  desired_center=None,
                  quality=0,
                  recalculate=False,
+                 subframe_origin=(0,0),
+                 binning=(1,1),
                  date_obs_key='DATE-OBS',
                  exptime_key='EXPTIME',
                  darktime_key='DARKTIME',
@@ -273,6 +275,8 @@ class PGData(ADU, FbuCCDData):
         self.obj_center = obj_center
         self.desired_center = desired_center
         self.quality = quality
+        self.subframe_origin = subframe_origin
+        self.binning = binning
         self.date_obs_key = date_obs_key
         self.exptime_key = exptime_key
         self.darktime_key = darktime_key
@@ -368,8 +372,10 @@ class PGData(ADU, FbuCCDData):
          >>>            self.meta['XBINNING'])
          >>> return binning
         """
-        binning = (1,1)
-        return binning
+        pass
+
+        #binning = (1,1)
+        #return binning
         
     @pgcoordproperty
     def subframe_origin(self):
@@ -384,8 +390,20 @@ class PGData(ADU, FbuCCDData):
          >>> subframe_origin *= self.binning
          >>> return subframe_origin
         """
-        subframe_origin = (0,0)
-        return subframe_origin
+        pass
+        #subframe_origin = (0,0)
+        #return subframe_origin
+
+    def _slice(self, item):
+        """Override NDSlicingMixin definition to move subframe origin"""
+        kwargs = super()._slice(item)
+        yslice = item[0]
+        xslice = item[1]
+        yorg = yslice.start or 0
+        xorg = xslice.start or 0
+        kwargs['subframe_origin'] = (yorg, xorg)
+        kwargs['binning'] = self.binning
+        return kwargs
 
     def unbinned(self, coords):
         """Returns coords referenced to full CCD given internally stored binning/subim info"""
@@ -1079,6 +1097,8 @@ if __name__ == "__main__":
     pgd = CenterOfMassPGD.read(fname1)
     print(pgd.obj_center, pgd.desired_center)
 
-#fname1 = '/data/io/IoIO/raw/20210310/HD 132052-S001-R001-C002-R.fts'
+#fname1 = '/data/IoIO/raw/20210310/HD 132052-S001-R001-C002-R.fts'
 #pgd = MaxImPGD.read(fname1)
-#print(pgd.meta)
+##print(pgd.meta)
+#sub = pgd[0:100, 20:100]
+#print(sub.subframe_origin)
