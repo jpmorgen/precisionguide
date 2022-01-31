@@ -7,6 +7,9 @@ uploaded to any other platform for detailed analysis using this same
 code.
 
 """
+
+from copy import deepcopy
+
 import numpy as np
 
 from scipy.signal import convolve2d
@@ -37,7 +40,7 @@ class pgproperty(property):
 
     . No setter is required to set the property, but if one is
     provided, its return value is used as the cached value that
-    overrides the getter (i.e., not knowledge of the internal workings
+    overrides the getter (i.e., no knowledge of the internal workings
     of the system is requried to make it work)
 
     . Deleters can be specified to do something before the cache
@@ -51,7 +54,7 @@ class pgproperty(property):
         present, value provided by user.  
         . None: the value is cached without modification
         . 0: value is converted to a numpy array with np.asarray()
-        . tuple: shape of resulting np.array must match shape_check or
+        . tuple: like 0 but shape of value must match shape_check or
         a ValueError is raised
 
     Inspired by `astropy.utils.lazyproperty` and `property_manager
@@ -91,7 +94,7 @@ class pgproperty(property):
     def npval(self, val):
         """Turn val into np.array if shape_check is non-None.  Checks
         shape of resulting array if shape_check is a tuple"""
-        if self.shape_check is None:
+        if self.shape_check is None or val is None:
             return val
         val = np.asarray(val)
         if (self.shape_check != 0
@@ -122,8 +125,7 @@ class pgproperty(property):
         obj_dict = obj.__dict__
         if self.fset:
             val = self.fset(obj, val)
-        if val is not None:
-            val = self.npval(val)
+        val = self.npval(val)
         obj_dict[self._key] = val
 
     def __delete__(self, obj):
@@ -259,19 +261,44 @@ class PGData(ADU, FbuCCDData):
 
     """
     def __init__(self,
-                 *args,
+                 data,
                  obj_center=None,
                  desired_center=None,
                  quality=0,
                  recalculate=False,
-                 subframe_origin=(0,0),
-                 binning=(1,1),
+                 subframe_origin=None,
+                 binning=None,
                  date_obs_key='DATE-OBS',
                  exptime_key='EXPTIME',
                  darktime_key='DARKTIME',
+                 copy=False,
                  **kwargs):
-        super().__init__(*args, **kwargs)
-        self.recalculate = recalculate
+        # Pattern after NDData init but skip all the tests
+        if isinstance(data, PGData):
+            # Sigh.  We have to undo the convenience of our pgproperty
+            # lest we trigger the calculation of property, which leads
+            # to recursion problems
+            obj_dict = data.__dict__
+            obj_center = obj_dict.get('obj_center')
+            desired_center = obj_dict.get('desired_center')
+            quality = obj_dict.get('quality')
+            subframe_origin = data.subframe_origin
+            binning = data.binning
+            date_obs_key = data.date_obs_key
+            exptime_key = data.exptime_key
+            darktime_key = data.darktime_key
+        if copy:
+            obj_center = deepcopy(obj_center)
+            desired_center = deepcopy(desired_center)
+            quality = deepcopy(quality)
+            subframe_origin = deepcopy(subframe_origin)
+            binning = deepcopy(binning)
+            date_obs_key = deepcopy(date_obs_key)
+            exptime_key = deepcopy(exptime_key)
+            darktime_key = deepcopy(darktime_key)            
+
+        super().__init__(data, copy=copy, **kwargs)
+        self.recalculate = recalculate # May be not appropriate at this level
         self.obj_center = obj_center
         self.desired_center = desired_center
         self.quality = quality
@@ -284,6 +311,41 @@ class PGData(ADU, FbuCCDData):
         self._invalid_obj_center = (-99, -99)
         self._invalid_desired_center = (-99, -99)
         self._invalid_quality = 0
+
+    def _init_args_copy(self, kwargs):
+        """The NDData _slice and _arithmetic methods create new class instances by running the __init__ method with the appropriate kwarg to copy over relevant property.  Thus we need to copy all our property into a keyword dictionary too"""
+        # Grab calculated property directly from our pgproperty
+        # decorator system so it doesn't trigger calculations!
+        obj_dict = self.__dict__
+        obj_center = obj_dict.get('obj_center')
+        desired_center = obj_dict.get('desired_center')
+        quality = obj_dict.get('quality')
+        kwargs['obj_center'] = obj_center
+        kwargs['desired_center'] = desired_center
+        kwargs['quality'] = quality
+        kwargs['subframe_origin'] = self.subframe_origin
+        kwargs['binning'] = self.binning
+        kwargs['date_obs_key'] = self.date_obs_key
+        kwargs['exptime_key'] = self.exptime_key
+        kwargs['darktime_key'] = self.darktime_key
+        return kwargs
+        
+    def _arithmetic(self, *args, **kwds):
+        """Insert our property when new class instances are created using arithmetic"""
+        result, kwargs = super()._arithmetic(*args, **kwds)
+        kwargs = self._init_args_copy(kwargs)
+        return result, kwargs
+
+    def _slice(self, item):
+        """Override NDSlicingMixin definition to move subframe origin"""
+        kwargs = super()._slice(item)
+        kwargs = self._init_args_copy(kwargs)
+        yslice = item[0]
+        xslice = item[1]
+        yorg = yslice.start or 0
+        xorg = xslice.start or 0
+        kwargs['subframe_origin'] = (yorg, xorg)
+        return kwargs
 
     @pgcoordproperty
     def obj_center(self):
@@ -394,27 +456,69 @@ class PGData(ADU, FbuCCDData):
         #subframe_origin = (0,0)
         #return subframe_origin
 
-    def _slice(self, item):
-        """Override NDSlicingMixin definition to move subframe origin"""
-        kwargs = super()._slice(item)
-        yslice = item[0]
-        xslice = item[1]
-        yorg = yslice.start or 0
-        xorg = xslice.start or 0
-        kwargs['subframe_origin'] = (yorg, xorg)
-        kwargs['binning'] = self.binning
-        return kwargs
-
-    def unbinned(self, coords):
-        """Returns coords referenced to full CCD given internally stored binning/subim info"""
+    def coord_unbinned(self, coords):
+        """Returns pixel coords referenced to full CCD given internally stored binning/subim info"""
         coords = np.asarray(coords)
-        return self.binning * coords + self.subframe_origin
+        unbinned = self.binning * coords + self.subframe_origin
+        return unbinned.astype(int)
 
-    def binned(self, coords):
-        """Assuming coords are referenced to full CCD, return location in binned coordinates relative to the subframe origin"""
+    def x_unbinned(self, coords):
+        """Returns x coord referenced to full CCD given internally stored binning/subim info"""
         coords = np.asarray(coords)
-        return (coords - self.subframe_origin) / self.binning
+        unbinned = self.binning[1] * coords + self.subframe_origin[1]
+        return unbinned.astype(int)
         
+    def y_unbinned(self, coords):
+        """Returns y coord referenced to full CCD given internally stored binning/subim info"""
+        coords = np.asarray(coords)
+        unbinned = self.binning[0] * coords + self.subframe_origin[0]
+        return unbinned.astype(int)
+
+    def coord_binned(self, coords, limit_edges=False):
+        """Assuming coords are referenced to full CCD, return location in binned coordinates relative to the subframe origin.  Limit_edges=True sets output value(s) that would otherwise fall outside the binned image to the appropriate boundary value """
+        coords = np.asarray(coords)
+        binned_coords = (coords - self.subframe_origin) / self.binning
+        if not limit_edges:
+            return binned_coords
+        s = np.asarray(self.shape)
+        if len(coords.shape) == 1:
+            binned_coords[0] = np.min((s[0], binned_coords[0]))
+            binned_coords[1] = np.min((s[1], binned_coords[1]))
+            return binned_coords.astype(int)
+        lidx = np.flatnonzero(binned_coords[0, :] > s[0])
+        binned_coords[0, lidx] = s[0]
+        lidx = np.flatnonzero(binned_coords[1, :] > s[1])
+        binned_coords[1, lidx] = s[1]
+        return binned_coords.astype(int)
+
+    def x_binned(self, xs, **kwargs):
+        """Assuming x coords are referenced to full CCD, return location in binned coordinates relative to the subframe origin.  Limit_edges=True sets output value(s) that would otherwise fall outside the binned image to the appropriate boundary value """
+        if np.isscalar(xs):
+            unbinned_coords = np.asarray((-99, xs))
+            binned_coords = self.coord_binned(unbinned_coords, **kwargs)
+            xs = binned_coords[1]
+        else:
+            xs = np.asarray(xs)
+            ys = len(xs)*(-99,)
+            unbinned_coords = list(zip(ys, xs))
+            binned_coords = self.coord_binned(unbinned_coords, **kwargs)
+            xs = binned_coords[:, 1]
+        return xs
+       
+    def y_binned(self, ys, **kwargs):
+        """Assuming x coords are referenced to full CCD, return location in binned coordinates relative to the subframe origin.  Limit_edges=True sets output value(s) that would otherwise fall outside the binned image to the appropriate boundary value """ 
+        if np.isscalar(ys):
+            unbinned_coords = np.asarray((ys, -99))
+            binned_coords = self.coord_binned(unbinned_coords, **kwargs)
+            ys = binned_coords[0]
+        else:
+            ys = np.asarray(ys)
+            xs = len(ys)*(-99,)
+            unbinned_coords = list(zip(ys, xs))
+            binned_coords = self.coord_binned(unbinned_coords, **kwargs)
+            ys = binned_coords[:, 0]
+        return ys
+       
     def im_unbinned(self, a):
         """Returns an unbinned version of a.  a must be same shape as self.data
         NOTE: to preserve flux, divide by (np.prod(self.binning)
@@ -457,7 +561,7 @@ class PGData(ADU, FbuCCDData):
             # We are already unbinned, don't bother to copy
             return self
         # If we made it here, we need to unbin
-        self_unbinned = self.copy()
+        self_unbinned = deepcopy(self)
         self_unbinned.data = self.im_unbinned(self.data)
         self_unbinned.mask = self.im_unbinned(self.mask)
         self_unbinned.uncertainty = self.im_unbinned(self.uncertainty)
@@ -477,8 +581,8 @@ class PGData(ADU, FbuCCDData):
         """
         # I may want to also export the binning information for
         # display purposes in precisionguide
-        return PGCenter(self.unbinned(self.obj_center),
-                        self.unbinned(self.desired_center),
+        return PGCenter(self.coord_unbinned(self.obj_center),
+                        self.coord_unbinned(self.desired_center),
                         self.quality,
                         self.tavg)
 
@@ -1102,3 +1206,11 @@ if __name__ == "__main__":
 ##print(pgd.meta)
 #sub = pgd[0:100, 20:100]
 #print(sub.subframe_origin)
+
+#fname = '/data/IoIO/raw/2021-04_Astrometry/Main_Astrometry_East_of_Pier.fit'
+#c = MaxImPGD.read(fname)
+#print(c.binning)
+#print(c.x_binned(6))
+#print(c.x_binned(np.asarray((6, 12, 24, 48))))
+#print(c.y_binned(6))
+#print(c.y_binned(np.asarray((6, 12, 24, 48))))
