@@ -22,6 +22,15 @@ from astropy.time import Time
 
 from ccdmultipipe.utils.ccddata import FbuCCDData
 
+INVALID_CENTER = (-99, -99)
+INVALID_CENTER_QUALITY = 0
+
+# These are generic keywords that need to get tailored
+DATE_OBS_KEY = 'DATE-OBS'
+EXPTIME_KEY = 'EXPTIME'
+EXPTIME_UNIT = u.s
+DARKTIME_KEY = 'DARKTIME'
+
 _NotFound = object()
 
 ###########################
@@ -137,6 +146,7 @@ class pgproperty(property):
 class pgcoordproperty(pgproperty):
     shape_check=(2,)
 
+
 #######################
 # Primary Objects     #
 #######################
@@ -168,12 +178,7 @@ class PGCenter():
         determination, with 1 = very bad, 10 = very good, 0 = invalid
 
     tavg : `~astropy.time.Time`
-        Average time of observation.  For simple exposures, this is
-        the midpoint.  For exposures integrated from several segments
-        one might imagine this would be the average of the exposure
-        efficiency as a function of time.  Hoever Rots et al (A&A 574,
-        A36 2015) note no standard is defined.  This turns into the
-        DATE-AVG FITS keyword
+        Average time of observation.  See `:prop:~precisionguide.PGData.tavg`
 
     """
     def __init__(self,
@@ -202,7 +207,7 @@ class PGCenter():
     @center_quality.setter
     def center_quality(self, value):
         """Unset center_quality translates to 0 center_quality"""
-        return center_quality_checker(value)
+        self._center_quality = center_quality_checker(value)
     
     @pgproperty
     def tavg(self):
@@ -268,9 +273,11 @@ class PGData(ADU, FbuCCDData):
                  recalculate=False,
                  subframe_origin=None,
                  binning=None,
-                 date_obs_key='DATE-OBS',
-                 exptime_key='EXPTIME',
-                 darktime_key='DARKTIME',
+                 date_obs_key=DATE_OBS_KEY,
+                 exptime_key=EXPTIME_KEY,
+                 exptime_unit=EXPTIME_UNIT,
+                 darktime_key=DARKTIME_KEY,
+                 obs_location=None,
                  copy=False,
                  **kwargs):
         # Pattern after NDData init but skip all the tests
@@ -286,7 +293,9 @@ class PGData(ADU, FbuCCDData):
             binning = data.binning
             date_obs_key = data.date_obs_key
             exptime_key = data.exptime_key
+            exptime_unit = data.exptime_unit
             darktime_key = data.darktime_key
+            obs_location = obs_location
         if copy:
             obj_center = deepcopy(obj_center)
             desired_center = deepcopy(desired_center)
@@ -295,7 +304,9 @@ class PGData(ADU, FbuCCDData):
             binning = deepcopy(binning)
             date_obs_key = deepcopy(date_obs_key)
             exptime_key = deepcopy(exptime_key)
+            exptime_unit = deepcopy(exptime_unit)
             darktime_key = deepcopy(darktime_key)            
+            obs_location = deepcopy(obs_location)            
 
         super().__init__(data, copy=copy, **kwargs)
         self.recalculate = recalculate # May be not appropriate at this level
@@ -306,10 +317,9 @@ class PGData(ADU, FbuCCDData):
         self.binning = binning
         self.date_obs_key = date_obs_key
         self.exptime_key = exptime_key
+        self.exptime_unit = exptime_unit
         self.darktime_key = darktime_key
-        self._invalid_obj_center = (-99, -99)
-        self._invalid_desired_center = (-99, -99)
-        self._invalid_center_quality = 0
+        self.obs_location = obs_location
 
     def _init_args_copy(self, kwargs):
         """The NDData _slice and _arithmetic methods create new class instances by running the __init__ method with the appropriate kwarg to copy over relevant property.  Thus we need to copy all our property into a keyword dictionary too"""
@@ -326,6 +336,7 @@ class PGData(ADU, FbuCCDData):
         kwargs['date_obs_key'] = self.date_obs_key
         kwargs['exptime_key'] = self.exptime_key
         kwargs['darktime_key'] = self.darktime_key
+        kwargs['obs_location'] = self.obs_location
         return kwargs
         
     def _arithmetic(self, *args, **kwds):
@@ -354,15 +365,16 @@ class PGData(ADU, FbuCCDData):
     full detector.  Use :meth:`unbinned(self.obj_center)` to obtain
     the coordinates in raw detector pixels.  Quality of center
     determination must be set as well.  Base class uses out-of-bounds
-    value (-99, -99) for center and 0 for center_quality
+    value of `precisionguide.INVALID_CENTER` for center and
+    `precisionguide.INVALID_CENTER_QUALITY` for center_quality
 
         Results are stored using the :class:`pgcoordproperty`
         decorator system.  See documentation of that class for
         explanation of features.
 
         """
-        obj_center = self._invalid_obj_center
-        self.center_quality = self._invalid_center_quality
+        obj_center = INVALID_CENTER
+        self.center_quality = INVALID_CENTER_QUALITY
         return obj_center
 
     @pgcoordproperty
@@ -398,18 +410,61 @@ class PGData(ADU, FbuCCDData):
         self._center_quality = center_quality_checker(value)
 
     @pgproperty
+    def obs_location(self):
+        """Return `~astropy.coordinates.EarthLocation` of observatory.  NOTE:
+        for the basic precisionguide system to work, this property is
+        not necessary because only time deltas between observations at
+        the observatory are used in calculations.  Setting this
+        property in a subclass is desirable if
+        `~:prop:precisionguide.PGData.tavg` of that subclass class is
+        used in calculations involving light travel time between the
+        observatory and a distant point (e.g. the solar system
+        barycenter).
+
+        """
+        return None
+        # SAMPLE CODE:
+        #from astropy.coordinates import EarthLocation
+        #lon = hdr.get('long-obs')
+        #lat = hdr.get('lat-obs')
+        ## Just use an average elevation if none is available, since that
+        ## is probably better than default of elevation = 0
+        ## https://www.quora.com/What-is-the-average-elevation-of-Earth-above-the-ocean-including-land-area-below-sea-level-What-is-the-atmospheric-pressure-at-that-elevation
+        #alt = hdr.get('alt-obs') or 800 * u.m
+        #return EarthLocation.from_geodetic(lon, lat, alt)
+
+    @pgproperty
     def tavg(self):
-        """`~astropy.time.Time` Average time of observation,  See
-        :param:`tavg` of :class:`PGCenter.`""" 
-        
-        tavg_str = self.meta.get('date-avg')
+        """`~astropy.time.Time` Average time of observation.  For simple
+        exposures, this is the midpoint.  For exposures integrated
+        from several segments one might imagine this would be the
+        average of the exposure efficiency as a function of time.
+        However Rots et al (A&A 574, A36 2015) note no standard is
+        defined.  This can turn into the DATE-AVG FITS keyword,
+        although astropy.wcsparm deletes that when a
+        `~astropy.nddata.CCDData` is read in.  The astropy standard is
+        to assume the DATE-OBS keyword represents the start of the
+        exposure.  There is no standard for exposure time, hence the
+        `:prop:precisionguide.PGData.exptime` property.  For timing
+        calculations involving two distant points and/or moving
+        frames, the observatory location should be specified via
+        `:prop:precisionguide.PGData.obs_location`
+
+        """ 
+        timesys = self.meta.get('TIMESYS') or 'UTC'
+        tavg_str = self.meta.get('DATE-AVG')
         if tavg_str is not None:
-            return Time(tavg_str, format='fits')
+            return Time(tavg_str, format='fits',
+                        scale=timesys.lower(),
+                        location=self.obs_location)
         try:
             exptime = self.meta[self.exptime_key.lower()]
-            exptime *= u.s
-            dateobs_str = self.meta[self.date_obs_key.lower()] 
-            return Time(dateobs_str, format='fits') + exptime/2
+            exptime *= self.exptime_unit
+            dateobs_str = self.meta[self.date_obs_key.lower()]
+            tbeg = Time(dateobs_str, format='fits',
+                        scale=timesys.lower(),
+                        location=self.obs_location)
+            return tbeg + exptime/2
         except:
             log.error(f'Cannot read sufficient combination of '
                       '{self.date_obs_key}, {self.darktime_key} '
@@ -420,7 +475,7 @@ class PGData(ADU, FbuCCDData):
     @tavg.setter
     def tavg(self, val):
         if not isinstance(val, Time):
-            raise ValueError('tavg must be of type `~astropy.time.Time`')
+            raise ValueError('tavg must be of type `astropy.time.Time`')
 
     @pgcoordproperty
     def binning(self):
@@ -592,7 +647,7 @@ class PGData(ADU, FbuCCDData):
 
         """
         if not np.all(np.isfinite(self.obj_center)):
-            self.obj_center = self._invalid_obj_center
+            self.obj_center = INVALID_CENTER
             log.warning(f'non-finite obj_center found, converting to '
                         f'{self.obj_center}')
         # Note pythonic y, x coordinate ordering
@@ -603,7 +658,7 @@ class PGData(ADU, FbuCCDData):
         self.meta['DES_CR0'] = (self.desired_center[1], 'Desired center X')
         self.meta['DES_CR1'] = (self.desired_center[0], 'Desired center Y')
         self.meta['HIERARCH CENTER_QUALITY'] = (
-            self.center_quality or self._invalid_center_quality,
+            self.center_quality or INVALID_CENTER_QUALITY,
             'Quality on 0-10 scale '
             'of center determination')
         # As per https://www.aanda.org/articles/aa/pdf/2015/02/aa24653-14.pdf
@@ -984,6 +1039,7 @@ class CenterOfMassPGD(BackgroundPGD):
         #bsub = self.subtract(self.background, handle_meta='first_found')
         #return center_of_mass(bsub.data)
         bsub = self.data - self.background
+        self.center_quality = 6
         return center_of_mass(bsub)
 
 class BrightestPGD(PGData):
@@ -1205,8 +1261,8 @@ if __name__ == "__main__":
     pgd = CenterOfMassPGD.read(fname1)
     print(pgd.obj_center, pgd.desired_center)
 
-fname1 = '/data/IoIO/raw/20210310/HD 132052-S001-R001-C002-R.fts'
-pgd = MaxImPGD.read(fname1)
+#fname1 = '/data/IoIO/raw/20210310/HD 132052-S001-R001-C002-R.fts'
+#pgd = MaxImPGD.read(fname1)
 ##print(pgd.meta)
 #sub = pgd[0:100, 20:100]
 #print(sub.subframe_origin)
