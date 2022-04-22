@@ -19,17 +19,16 @@ from astropy import log
 from astropy.io import fits
 from astropy import units as u
 from astropy.time import Time
-
+from astropy.coordinates import (EarthLocation, SkyCoord)
+                                 
 from ccdmultipipe.utils.ccddata import FbuCCDData
 
 INVALID_CENTER = (-99, -99)
 INVALID_CENTER_QUALITY = 0
 
-# These are generic keywords that need to get tailored
+# This is the astropy standard, but may not be used be a particular
+# camera system
 DATE_OBS_KEY = 'DATE-OBS'
-EXPTIME_KEY = 'EXPTIME'
-EXPTIME_UNIT = u.s
-DARKTIME_KEY = 'DARKTIME'
 
 _NotFound = object()
 
@@ -265,6 +264,9 @@ class PGData(ADU, FbuCCDData):
     ----------
 
     """
+    date_obs_key = DATE_OBS_KEY
+    exptime_key = None
+    exptime_unit = None
     def __init__(self,
                  data,
                  obj_center=None,
@@ -273,11 +275,11 @@ class PGData(ADU, FbuCCDData):
                  recalculate=False,
                  subframe_origin=None,
                  binning=None,
-                 date_obs_key=DATE_OBS_KEY,
-                 exptime_key=EXPTIME_KEY,
-                 exptime_unit=EXPTIME_UNIT,
-                 darktime_key=DARKTIME_KEY,
+                 date_obs_key=None,
+                 exptime_key=None,
+                 exptime_unit=None,
                  obs_location=None,
+                 sky_coord=None,
                  copy=False,
                  **kwargs):
         # Pattern after NDData init but skip all the tests
@@ -288,14 +290,14 @@ class PGData(ADU, FbuCCDData):
             obj_dict = data.__dict__
             obj_center = obj_dict.get('obj_center')
             desired_center = obj_dict.get('desired_center')
+            obj_location = obj_dict.get('obj_location')
+            sky_coord = obj_dict.get('sky_coord')        
             center_quality = data._center_quality
             subframe_origin = data.subframe_origin
             binning = data.binning
             date_obs_key = data.date_obs_key
             exptime_key = data.exptime_key
             exptime_unit = data.exptime_unit
-            darktime_key = data.darktime_key
-            obs_location = obs_location
         if copy:
             obj_center = deepcopy(obj_center)
             desired_center = deepcopy(desired_center)
@@ -305,10 +307,13 @@ class PGData(ADU, FbuCCDData):
             date_obs_key = deepcopy(date_obs_key)
             exptime_key = deepcopy(exptime_key)
             exptime_unit = deepcopy(exptime_unit)
-            darktime_key = deepcopy(darktime_key)            
             obs_location = deepcopy(obs_location)            
+            sky_coord = deepcopy(sky_coord)
 
         super().__init__(data, copy=copy, **kwargs)
+        date_obs_key = date_obs_key or self.date_obs_key
+        exptime_key = exptime_key or self.exptime_key
+        exptime_unit = exptime_unit or self.exptime_unit
         self.recalculate = recalculate # May be not appropriate at this level
         self.obj_center = obj_center
         self.desired_center = desired_center
@@ -318,8 +323,8 @@ class PGData(ADU, FbuCCDData):
         self.date_obs_key = date_obs_key
         self.exptime_key = exptime_key
         self.exptime_unit = exptime_unit
-        self.darktime_key = darktime_key
         self.obs_location = obs_location
+        self.sky_coord = sky_coord
 
     def _init_args_copy(self, kwargs):
         """The NDData _slice and _arithmetic methods create new class instances by running the __init__ method with the appropriate kwarg to copy over relevant property.  Thus we need to copy all our property into a keyword dictionary too"""
@@ -328,6 +333,8 @@ class PGData(ADU, FbuCCDData):
         obj_dict = self.__dict__
         obj_center = obj_dict.get('obj_center')
         desired_center = obj_dict.get('desired_center')
+        obs_location = obj_dict.get('obj_location')
+        sky_coord = obj_dict.get('sky_coord')        
         kwargs['obj_center'] = obj_center
         kwargs['desired_center'] = desired_center
         kwargs['center_quality'] = self._center_quality
@@ -335,8 +342,8 @@ class PGData(ADU, FbuCCDData):
         kwargs['binning'] = self.binning
         kwargs['date_obs_key'] = self.date_obs_key
         kwargs['exptime_key'] = self.exptime_key
-        kwargs['darktime_key'] = self.darktime_key
-        kwargs['obs_location'] = self.obs_location
+        kwargs['obs_location'] = obs_location
+        kwargs['sky_coord'] = sky_coord
         return kwargs
         
     def _arithmetic(self, *args, **kwds):
@@ -411,47 +418,66 @@ class PGData(ADU, FbuCCDData):
 
     @pgproperty
     def obs_location(self):
-        """Return `~astropy.coordinates.EarthLocation` of observatory.  NOTE:
-        for the basic precisionguide system to work, this property is
-        not necessary because only time deltas between observations at
-        the observatory are used in calculations.  Setting this
-        property in a subclass is desirable if
-        `~:prop:precisionguide.PGData.tavg` of that subclass class is
-        used in calculations involving light travel time between the
-        observatory and a distant point (e.g. the solar system
-        barycenter).
+        """Returns default value of `~astropy.coordinates.EarthLocation` of
+        observatory: geocenter.
+
+        Subclasses are responsible for setting this property more
+        accurately from FITS keywords.
+
+        NOTE: for the basic precisionguide system to work, this
+        property is not necessary, however, if a subclass does set
+        this property accurately, `:prop:precisionguide.PGData.tavg
+        will be tied to the precise observing site, which provides the
+        most accurate time delta calculations
 
         """
-        return None
-        # SAMPLE CODE:
-        #from astropy.coordinates import EarthLocation
-        #lon = hdr.get('long-obs')
-        #lat = hdr.get('lat-obs')
-        ## Just use an average elevation if none is available, since that
-        ## is probably better than default of elevation = 0
-        ## https://www.quora.com/What-is-the-average-elevation-of-Earth-above-the-ocean-including-land-area-below-sea-level-What-is-the-atmospheric-pressure-at-that-elevation
-        #alt = hdr.get('alt-obs') or 800 * u.m
-        #return EarthLocation.from_geodetic(lon, lat, alt)
+        return EarthLocation(0,0,0, unit=u.m)
+
+    @pgproperty
+    def sky_coord(self):
+        """Return `~astropy.coordinates.SkyCoord` of object being observed.
+
+        NOTES: for the basic precisionguide system to work, this
+        property is not necessary.  A subclass may specify it by
+        reading the appropriate FITS keywords (usually unique to a
+        software or observatory setup).  The property is intended to
+        be read-only, so if a more refined value for the keywords is
+        generated by processing software, the FITS keywords should be
+        reset and reread when needed by setting self.sky_coord = None
+
+        """
+        assert False, ('Subclass must provide code to extract this '
+                       'from FITS keywords')
 
     @pgproperty
     def tavg(self):
-        """`~astropy.time.Time` Average time of observation.  For simple
-        exposures, this is the midpoint.  For exposures integrated
-        from several segments one might imagine this would be the
-        average of the exposure efficiency as a function of time.
-        However Rots et al (A&A 574, A36 2015) note no standard is
-        defined.  This can turn into the DATE-AVG FITS keyword,
-        although astropy.wcsparm deletes that when a
-        `~astropy.nddata.CCDData` is read in.  The astropy standard is
-        to assume the DATE-OBS keyword represents the start of the
-        exposure.  There is no standard for exposure time, hence the
-        `:prop:precisionguide.PGData.exptime` property.  For timing
-        calculations involving two distant points and/or moving
-        frames, the observatory location should be specified via
-        `:prop:precisionguide.PGData.obs_location`
+        """`~astropy.time.Time` Average time of observation.  
 
-        """ 
+        For simple exposures, this is the midpoint.  For exposures
+        integrated from several segments one might imagine this would
+        be the average of the exposure efficiency as a function of
+        time.  However Rots et al (A&A 574, A36 2015) note no standard
+        is defined.  
+
+        The astropy standard is to assume the DATE-OBS keyword
+        represents the start of the exposure.  There is no standard
+        for exposure time, hence the
+        `:prop:precisionguide.PGData.exptime` property.  
+
+        For precise timing calculations involving two distant points
+        and/or moving frames, the observatory location should be
+        specified via `:prop:precisionguide.PGData.obs_location`
+
+        The `~:class:precisionguide.PGData` base class does not
+        automatically write the DATE-AVG FITS keyword when the file is
+        saved, although subclasses may wish to.  In this case, OBJ-AVG
+        and MJD-AVG must also be written to prevent
+        `astropy.wcs.wcsparm` from deleting everything except DATE-OBS
+        when read using `~astropy.nddata.CCDData`
+
+        """
         timesys = self.meta.get('TIMESYS') or 'UTC'
+        # DATE-AVG is a WCS standard
         tavg_str = self.meta.get('DATE-AVG')
         if tavg_str is not None:
             return Time(tavg_str, format='fits',
@@ -465,11 +491,12 @@ class PGData(ADU, FbuCCDData):
                         scale=timesys.lower(),
                         location=self.obs_location)
             return tbeg + exptime/2
-        except:
+        except Exception as e:
+            log.error('Received error: ' + str(e))
             log.error(f'Cannot read sufficient combination of '
-                      '{self.date_obs_key}, {self.darktime_key} '
-                      'and/or {self.exptime_key} keywords from FITS '
-                      'header to establish tavg')
+                      f'DATE-AVG, {self.date_obs_key}, and/or '
+                      f'{self.exptime_key} keywords from FITS '
+                      f'header to establish tavg')
             return None
 
     @tavg.setter
@@ -1058,10 +1085,11 @@ class BrightestPGD(PGData):
         return super().obj_center + self.center_offset
     
 class MaxImPGD(PGData):
-    """Handles MaxIM DL :prop:`binning` and :prop:`subframe_origin`"""
+    """Handles MaxIM DL-specific FITS keywords"""
 
-    # It is important to just read these once, since we may modify
-    # them in the object before write
+    exptime_key = 'EXPTIME'
+    exptime_unit = u.s
+    
     @pgcoordproperty
     def binning(self):
         """Image binning in Y,X order"""
@@ -1079,6 +1107,65 @@ class MaxImPGD(PGData):
         subframe_origin *= self.binning
         return subframe_origin
 
+    @pgproperty
+    def obs_location(self):
+        """`~astropy.coordinates.EarthLocation` of observatory
+
+        See `:prop:precisionguide.PGData.obs_location` documentation
+
+        Observatory info must be set in MaxIm->Settings->Site and
+        Optics.  MaxIm does not record site elevation in FITS header.
+        If SITEALT is set, that is used.  If that is not present an
+        average Earth elevation of 800 meters is used.  WGS84
+        ellipsoid is used to convert lat, lon, alt to geocentric
+        coordinates.
+
+        """
+        lon = self.meta.get('sitelong')
+        lat = self.meta.get('sitelat')
+        alt = self.meta.get('sitealt') or 800 * u.m
+        try:
+            loc = EarthLocation.from_geodetic(lon, lat, alt)
+        except Exception as e:
+            log.warning('Setting obs_location received ' + str(e))
+            log.warning('Falling back to default')
+            loc = PGData(self).obs_location
+        return loc
+
+    @pgproperty
+    def sky_coord(self):
+        """`~astropy.coordinates.SkyCoord` of observation
+
+        See `:prop:precisionguide.PGData.sky_coord` documention
+
+        MaxIm records RA and DEC in the OBJECTRA and OBJECTDEC
+        keywords.  The values are are read from the telescope, if it
+        is connected.
+
+        The reference system used for the coordinates is queried using
+        standard FITS WCS keyords (RADECSYS or newer RADSYS) just in
+        case it is provided by another piece of software.  Otherwise
+        FK5 system is specified to override the
+        `~astropy.coordinates.SkyCoord` default of ICRS.  FK5 is the
+        older geocentric system.  ICRS is more accurate by a few
+        milli-arcsec, and referenced to the solar system barycenter,
+        thus ultimately more stable and suitable as a master reference
+        frame.  The baricentric perspective, however, makes
+        calculations with ICRS more involved (slower) and unsuitable
+        for calculating pointing separations between directions, one
+        of which includes a solar system object.  FK5 might be OK for
+        that, GCRS is better.
+
+        """
+        # If this fails, there is no default fallback
+        ra = self.meta.get('OBJCTRA')
+        dec = self.meta.get('OBJCTDEC')
+        unit = (u.hourangle, u.deg)
+        # Note convention of RADECSYS has changed over the years.
+        # RADESYS[ A-Z] is the latest
+        radesys = self.meta.get('RADESYS') or self.meta.get('RADECSYS') or 'FK5'
+        return SkyCoord(ra, dec, unit=unit, frame=radesys.lower())
+
     def _card_write(self):
         """Write FITS card unique to MaxIMPGD"""
         # Note pythonic y, x coordinate ordering
@@ -1091,6 +1178,35 @@ class MaxImPGD(PGData):
     def write(self, *args, **kwargs):
         self._card_write()
         super().write(*args, **kwargs)
+
+class ACPPGD(MaxImPGD):
+    """Handles ACP-specific FITS keywords
+
+    NOTE: ACP records telescope coordinates as the FITS keywords RA
+    and DEC as well as OBJCTRA and OBJCTDEC.  MaxImPGD handles the
+    later, so don't bother with RA and DEC
+
+    """
+
+    @pgproperty
+    def obs_location(self):
+        """`~astropy.coordinates.EarthLocation` of observatory
+
+        These must be specified in ACP -> Preferences -> Observatory.
+        WGS84 ellipsoid is used to convert lat, lon, alt to geocentric
+        coordinates.
+
+        """
+        lon = self.meta.get('LONG-OBS')
+        lat = self.meta.get('LAT-OBS')
+        alt = self.meta.get('ALT-OBS')
+        try:
+            loc = EarthLocation.from_geodetic(lon, lat, alt)
+        except Exception as e:
+            log.warning('Setting obs_location received ' + str(e))
+            log.warning('Falling back to MaxIm keywords')
+            loc = MaxImPGD(self).obs_location
+        return loc
 
 if __name__ == "__main__":
     log.setLevel('DEBUG')
@@ -1257,9 +1373,12 @@ if __name__ == "__main__":
     #
     #ccd = FbuCCDData.read(fname1, unit='electron')
 
-    fname1 = '/data/Mercury/raw/2020-05-27/Mercury-0005_Na-on.fit'
-    pgd = CenterOfMassPGD.read(fname1)
-    print(pgd.obj_center, pgd.desired_center)
+    #fname1 = '/data/Mercury/raw/2020-05-27/Mercury-0005_Na-on.fit'
+    #pgd = CenterOfMassPGD.read(fname1)
+    #print(pgd.obj_center, pgd.desired_center)
+
+    fname = '/data/IoIO/raw/2017-03-07/Jupiter-0001IPT.fit'
+    ccd = MaxImPGD.read(fname)
 
 #fname1 = '/data/IoIO/raw/20210310/HD 132052-S001-R001-C002-R.fts'
 #pgd = MaxImPGD.read(fname1)
