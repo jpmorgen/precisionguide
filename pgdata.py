@@ -146,6 +146,13 @@ class pgcoordproperty(pgproperty):
     shape_check=(2,)
 
 
+def is_valid_center(center):
+    if center is None:
+        return False
+    if center[0] == INVALID_CENTER[0] and center[1] == INVALID_CENTER[1]:
+        return False
+    return True
+
 #######################
 # Primary Objects     #
 #######################
@@ -327,7 +334,12 @@ class PGData(ADU, FbuCCDData):
         self.sky_coord = sky_coord
 
     def _init_args_copy(self, kwargs):
-        """The NDData _slice and _arithmetic methods create new class instances by running the __init__ method with the appropriate kwarg to copy over relevant property.  Thus we need to copy all our property into a keyword dictionary too"""
+        """The NDData _slice and _arithmetic methods create new class
+        instances by running the __init__ method with the appropriate
+        kwarg to copy over relevant property.  Thus we need to copy
+        all our property into a keyword dictionary too
+
+        """
         # Grab calculated property directly from our pgproperty
         # decorator system so it doesn't trigger calculations!
         obj_dict = self.__dict__
@@ -353,7 +365,10 @@ class PGData(ADU, FbuCCDData):
         return result, kwargs
 
     def _slice(self, item):
-        """Override NDSlicingMixin definition to move subframe origin"""
+        """Override NDSlicingMixin definition to move subframe origin and
+        obj_center and desired_center
+
+        """
         kwargs = super()._slice(item)
         kwargs = self._init_args_copy(kwargs)
         yslice = item[0]
@@ -361,6 +376,14 @@ class PGData(ADU, FbuCCDData):
         yorg = yslice.start or 0
         xorg = xslice.start or 0
         kwargs['subframe_origin'] = (yorg, xorg)
+        c = kwargs['obj_center']
+        for center in ['obj_center', 'desired_center']:
+            c = kwargs[center]
+            if is_valid_center(c):
+                nc = c.copy()
+                nc[0] -= yorg
+                nc[1] -= xorg
+                kwargs[center] = (nc[0], nc[1])
         return kwargs
 
     @pgcoordproperty
@@ -645,7 +668,9 @@ class PGData(ADU, FbuCCDData):
         self_unbinned = deepcopy(self)
         self_unbinned.data = self.im_unbinned(self.data)
         self_unbinned.mask = self.im_unbinned(self.mask)
-        self_unbinned.uncertainty = self.im_unbinned(self.uncertainty)
+        if self_unbinned.uncertainty is not None:
+            self_unbinned.uncertainty.array = self.im_unbinned(
+                self.uncertainty.array)
         self_unbinned.binning = np.asarray((1,1))
         self_unbinned.subframe_origin = np.asarray((0,0))
         # --> NOTE we are not messing with any other metadata
@@ -688,16 +713,35 @@ class PGData(ADU, FbuCCDData):
             self.center_quality or INVALID_CENTER_QUALITY,
             'Quality on 0-10 scale '
             'of center determination')
-        # As per https://www.aanda.org/articles/aa/pdf/2015/02/aa24653-14.pdf
-        if not self.meta.get('DATE-AVG'):
-            self.meta.insert('DATE-OBS',
-                             ('DATE-AVG', self.tavg.value,
-                              'midpoint of exposure, UT'),
-                             after=True)
+        # THINK MORE ABOUT THIS
+        #### As per https://www.aanda.org/articles/aa/pdf/2015/02/aa24653-14.pdf
+        ###if not self.meta.get('DATE-AVG'):
+        ###    self.meta.insert('DATE-OBS',
+        ###                     ('DATE-AVG', self.tavg.value,
+        ###                      'midpoint of exposure, UT'),
+        ###                     after=True)
 
     def write(self, *args, **kwargs):
         self._card_write()
         super().write(*args, **kwargs)
+
+    @classmethod
+    def read(cls, filename, **kwargs):
+        ccd = super().read(filename, **kwargs)
+        obj_cr0 = ccd.meta.get('OBJ_CR0')
+        obj_cr1 = ccd.meta.get('OBJ_CR1')
+        des_cr0 = ccd.meta.get('DES_CR0')
+        des_cr1 = ccd.meta.get('DES_CR1')
+        quality = ccd.meta.get('CENTER_QUALITY')
+        if (obj_cr0 is not None
+            and obj_cr1 is not None
+            and des_cr0 is not None
+            and des_cr1 is not None
+            and quality is not None):
+            ccd.obj_center = (obj_cr1, obj_cr0)
+            ccd.des_center = (des_cr1, des_cr0)
+            ccd.center_quality = quality
+        return cls(ccd, **kwargs)
 
 class NoCenterPGD(PGData):
     """Sets :prop:`obj_center` to invalid value and :prop:`center_quality` to 0`"""
@@ -912,14 +956,12 @@ class Ex(PGData):
     @pgcoordproperty
     def obj_center(self):
         # Pattern for all that want to read the FITS
-        print('in obj_center')
         t = super().obj_center
         return t
 
 class ExampleFITSReaderPGD(FITSReaderPGD):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        print('in init')              
 
     @pgcoordproperty
     def obj_center(self):
@@ -1174,10 +1216,6 @@ class MaxImPGD(PGData):
         self.meta['XORGSUBF'] = self.subframe_origin[1]
         self.meta['YORGSUBF'] = self.subframe_origin[0]
         super()._card_write()
-
-    def write(self, *args, **kwargs):
-        self._card_write()
-        super().write(*args, **kwargs)
 
 class ACPPGD(MaxImPGD):
     """Handles ACP-specific FITS keywords
