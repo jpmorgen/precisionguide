@@ -19,7 +19,7 @@ from astropy import log
 from astropy.io import fits
 from astropy import units as u
 from astropy.time import Time
-from astropy.coordinates import (EarthLocation, SkyCoord)
+from astropy.coordinates import EarthLocation, SkyCoord
                                  
 from ccdmultipipe.utils.ccddata import FbuCCDData
 
